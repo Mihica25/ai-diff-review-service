@@ -74,11 +74,19 @@ otherwise. At submission, pull the most relevant entry (or entries) into SUBMISS
 - `SELECT ... FOR UPDATE SKIP LOCKED` must run inside a transaction that also flips
   the row to `running` before releasing the lock, or two workers can claim the same job
 - Use a connection pool (pg-pool or similar) with a sane max size — don't open a new
-  connection per request
+  connection per request. If the chosen Postgres host is a serverless/free-tier provider
+  with a low connection cap (e.g. Neon), use its pooled/pgbouncer connection string, not
+  the direct one — the cap is easy to exhaust under the 30/min + 4-concurrent load test,
+  and that's the most plausible way to accidentally trip "never 5xx under load"
 - SSE replay is commonly broken — store the event log per job, don't regenerate on reconnect
 - `usage.chunks` must reflect the real chunk count even when maxFindings truncates results
 - Declared /spec limits must match actual server behavior exactly
 - llm provider must fail gracefully (status: failed, clear error) — never crash the process
+- llm provider calls need a bounded timeout (e.g. ~15-20s via `AbortController`), not just
+  error-handling. A *hang* (as opposed to an error) occupies one of only 4 worker slots for
+  the rest of the scoring window and can starve the mock-provider queue behind it. This
+  isn't retry logic — it's what makes "one attempt" actually finite — so it doesn't
+  conflict with "no retry/backoff sophistication" below
 - Don't couple the mock rule engine to Fastify internals — keep it a pure function for easy testing
 
 ## What NOT to over-build
