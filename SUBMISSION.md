@@ -14,4 +14,15 @@
   I specifically tested a cold-boot scenario — wiped the database schema
   entirely, then ran only `npm start` with no manual steps beforehand — to
   confirm the tables get created automatically, so this couldn't silently
-  break the first deploy on Render.
+  break the first deploy. This was later confirmed for real on Railway too —
+  the deployed logs show `applied migration 001_init.sql` before the server
+  starts listening.
+
+## Scope decisions
+
+- **Single static bearer token, no per-client identity.** Auth is a shared-token
+  comparison, matching the contract exactly ("the token you give us at
+  submission" — singular). Rate limiting (30/min) and the concurrency cap
+  (4 workers) are service-wide budgets, not per-client, since the contract
+  defines one tenant, not many. Adding per-client isolation (separate tokens,
+  separate quotas) would be solving a problem the contract doesn't pose.

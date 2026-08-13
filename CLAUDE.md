@@ -88,6 +88,12 @@ otherwise. At submission, pull the most relevant entry (or entries) into SUBMISS
   isn't retry logic — it's what makes "one attempt" actually finite — so it doesn't
   conflict with "no retry/backoff sophistication" below
 - Don't couple the mock rule engine to Fastify internals — keep it a pure function for easy testing
+- The global `setErrorHandler` in `src/server.ts` (Phase 1) maps every caught error to
+  `code: "internal"` — that's correct today since nothing throws anything else yet, but
+  Phase 3's `POST /v1/reviews` body validation must NOT rely on it. Malformed JSON,
+  missing/empty diff, and oversized payloads need their own explicit `invalid_json` /
+  `invalid_diff` / `payload_too_large` responses per-route, not fall through to this
+  catch-all — otherwise they'll all incorrectly report `code: "internal"`
 
 ## What NOT to over-build
 - No message broker (Kafka, RabbitMQ, BullMQ+Redis) — Postgres row-claiming via

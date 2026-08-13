@@ -11,7 +11,7 @@ async function main(): Promise<void> {
   // platforms give no SSH access to run this manually before starting the app.
   await runMigrations(pool);
 
-  const app = buildServer(pool);
+  const app = buildServer(pool, config);
 
   const shutdown = async (): Promise<void> => {
     await app.close();
