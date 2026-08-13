@@ -6,6 +6,21 @@ export interface AddedLine {
 }
 
 const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+// TODO(reuse): hand-duplicated from HUNK_HEADER above rather than derived
+// from it (e.g. `new RegExp(HUNK_HEADER.source, "m")`) — the two patterns
+// have to be kept in sync by hand if hunk-header tolerance ever changes.
+// Also low-confidence but worth a look: this only checks that a hunk-header
+// shaped substring exists anywhere in the body, not that it's structurally a
+// real hunk header (e.g. decoy text containing that exact shape would pass
+// this gate and then produce zero findings from the real parser).
+const HUNK_HEADER_ANYWHERE = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m;
+
+// A cheap "is this even a unified diff" check for request validation — a
+// diff with no hunk header at all can never produce any added lines, so it's
+// invalid per the contract ("not parseable as a unified diff" -> 422).
+export function looksLikeUnifiedDiff(diffText: string): boolean {
+  return HUNK_HEADER_ANYWHERE.test(diffText);
+}
 
 function extractPath(headerValue: string): string | null {
   const withoutTimestamp = (headerValue.split("\t")[0] ?? "").trim();

@@ -72,7 +72,7 @@ describe("bearer auth on /v1/*", () => {
     const app = makeApp();
     const res = await app.inject({
       method: "GET",
-      url: "/v1/reviews/some-id",
+      url: "/v1/this-route-does-not-exist",
       headers: { authorization: `Bearer ${BEARER_TOKEN}` },
     });
 

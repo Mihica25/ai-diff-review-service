@@ -2,6 +2,7 @@ import { loadConfig } from "./config";
 import { createPool } from "./db/pool";
 import { runMigrations } from "./db/migrate";
 import { buildServer } from "./server";
+import { startWorker } from "./worker";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -12,8 +13,10 @@ async function main(): Promise<void> {
   await runMigrations(pool);
 
   const app = buildServer(pool, config);
+  const worker = startWorker(pool);
 
   const shutdown = async (): Promise<void> => {
+    await worker.stop();
     await app.close();
     await pool.end();
     process.exit(0);
