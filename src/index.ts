@@ -1,13 +1,15 @@
 import { loadConfig } from "./config";
 import { createPool } from "./db/pool";
+import { runMigrations } from "./db/migrate";
 import { buildServer } from "./server";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const pool = createPool(config.DATABASE_URL);
 
-  // Fail fast if Postgres isn't reachable rather than binding HTTP first.
-  await pool.query("SELECT 1");
+  // Runs on every boot (idempotent, tracked in schema_migrations) since cloud
+  // platforms give no SSH access to run this manually before starting the app.
+  await runMigrations(pool);
 
   const app = buildServer(pool);
 
