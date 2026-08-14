@@ -87,6 +87,42 @@ describe("bearer auth on /v1/*", () => {
     const res = await app.inject({ method: "GET", url: "/health" });
     expect(res.statusCode).toBe(200);
   });
+
+  // Regression tests: the auth hook originally checked a naive string prefix
+  // on request.url, which is the raw, still percent-*encoded* path — not
+  // what Fastify's router actually decodes and matches against. A request to
+  // a percent-encoded "/v1/..." path (e.g. "/%76%31/reviews/some-id", which
+  // decodes to "/v1/reviews/some-id") had a raw request.url that didn't
+  // start with "/v1/", so the naive check let it through unauthenticated
+  // while the router still dispatched it to the real handler underneath —
+  // a full authentication bypass, confirmed live against the running server
+  // before this fix. The fix reads request.routeOptions.url (Fastify's own
+  // record of which route it actually matched) instead of re-deriving the
+  // decoding itself, so it can't diverge from what's actually dispatched.
+  it("rejects a percent-encoded path that decodes to a /v1/* route, with no token", async () => {
+    const app = makeApp();
+    const res = await app.inject({ method: "GET", url: "/%76%31/reviews/some-id" });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("rejects a dot-segment path that resolves to a /v1/* route, with no token", async () => {
+    const app = makeApp();
+    const res = await app.inject({ method: "GET", url: "/health/../v1/reviews/some-id" });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("still allows a correctly-authenticated request to reach the real route", async () => {
+    const app = makeApp();
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/reviews/some-id",
+      headers: { authorization: `Bearer ${BEARER_TOKEN}` },
+    });
+    // Auth passes (not 401) — this test's fake pool means the route handler
+    // itself will error past that point, which is fine, that's not what's
+    // under test here.
+    expect(res.statusCode).not.toBe(401);
+  });
 });
 
 describe("unknown routes", () => {

@@ -24,6 +24,7 @@ function makeJob(overrides: Partial<JobRow> = {}): JobRow {
     status: "running",
     diff: "diff-text",
     options: { provider: "mock", maxFindings: 100 },
+    contentHash: "hash-job-1",
     findings: null,
     usageInputBytes: 10,
     usageChunks: 1,

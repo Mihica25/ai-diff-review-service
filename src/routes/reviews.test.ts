@@ -95,6 +95,24 @@ describe("POST /v1/reviews", () => {
     expect(res.json()).toEqual({ error: { code: "invalid_json", message: expect.any(String) } });
   });
 
+  it("rejects an unsupported Content-Type with 415 invalid_json, not internal", async () => {
+    // Regression test: Fastify's own content-type-parser rejects this before
+    // the route ever runs (FST_ERR_CTP_INVALID_MEDIA_TYPE, statusCode 415).
+    // The error handler used to key on bare statusCode and only special-cased
+    // 400/413, so this fell through to the generic branch and reported
+    // `code: "internal"` despite being a client error, not a server one.
+    const app = makeApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/reviews",
+      headers: { ...authHeaders(), "content-type": "application/xml" },
+      payload: JSON.stringify({ diff: VALID_DIFF }),
+    });
+
+    expect(res.statusCode).toBe(415);
+    expect(res.json()).toEqual({ error: { code: "invalid_json", message: expect.any(String) } });
+  });
+
   it("rejects a payload over 1 MiB with 413 payload_too_large", async () => {
     const app = makeApp();
     const hugeDiff = VALID_DIFF + "x".repeat(1_048_576 + 1);

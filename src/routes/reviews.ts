@@ -1,10 +1,19 @@
 import { randomUUID } from "node:crypto";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { errorEnvelope } from "../errors";
-import { computeContentHash } from "../contentHash";
+import { computeContentHash, computeBodyHash } from "../contentHash";
 import { chunkDiff } from "../chunking";
-import { insertJob, getJobById } from "../db/jobs";
+import {
+  insertJob,
+  insertCachedJob,
+  getJobById,
+  IdempotencyKeyRace,
+  type IdempotencyWrite,
+  type JobStatus,
+} from "../db/jobs";
+import { getCacheEntry } from "../db/cache";
+import { getIdempotencyRecord } from "../db/idempotency";
 import { looksLikeUnifiedDiff } from "../providers/mock/parseDiff";
 
 // `provider`/`maxFindings` use .catch() rather than .default(): the closed
@@ -40,6 +49,68 @@ export function isValidJobId(id: string): boolean {
   return z.uuid().safeParse(id).success;
 }
 
+// Same lenient-fallback spirit as options above: there's no error code for
+// "malformed Idempotency-Key" in the closed taxonomy, so a missing, empty,
+// or absurdly long header is treated as if none was supplied at all, rather
+// than erroring. 200 chars is generous headroom for any real client's key.
+const MAX_IDEMPOTENCY_KEY_LENGTH = 200;
+
+function parseIdempotencyKeyHeader(header: string | string[] | undefined): string | undefined {
+  const value = Array.isArray(header) ? header[0] : header;
+  if (!value || value.length === 0 || value.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    return undefined;
+  }
+  return value;
+}
+
+type IdempotencyResolution =
+  | { kind: "replay"; jobId: string; status: JobStatus; errorCode: string | null; errorMessage: string | null }
+  | { kind: "conflict" };
+
+// Resolves an existing Idempotency-Key record against the freshly-computed
+// body hash: matching body -> replay that job (including its error, if it
+// failed); different body -> conflict. Shared between the initial lookup and
+// the race-recovery path (two concurrent requests with the same key), which
+// both need to resolve the exact same way once a record for the key exists.
+async function resolveIdempotencyKey(
+  app: FastifyInstance,
+  key: string,
+  bodyHash: string,
+): Promise<IdempotencyResolution | null> {
+  const existing = await getIdempotencyRecord(app.pool, key);
+  if (!existing) {
+    return null;
+  }
+  if (existing.bodyHash !== bodyHash) {
+    return { kind: "conflict" };
+  }
+  return {
+    kind: "replay",
+    jobId: existing.jobId,
+    status: existing.status,
+    errorCode: existing.errorCode,
+    errorMessage: existing.errorMessage,
+  };
+}
+
+// Single place that turns a resolution into an HTTP response — used by both
+// the pre-check and the race-recovery path, so the two can't silently drift
+// (the same class of bug as the chunking file-boundary duplication this
+// session already hit once).
+function sendIdempotencyResolution(reply: FastifyReply, resolution: IdempotencyResolution): void {
+  if (resolution.kind === "conflict") {
+    reply
+      .code(409)
+      .send(errorEnvelope("idempotency_conflict", "Idempotency-Key already used with a different request body"));
+    return;
+  }
+  const body: Record<string, unknown> = { jobId: resolution.jobId, status: resolution.status };
+  if (resolution.status === "failed") {
+    body.error = { code: resolution.errorCode ?? "internal", message: resolution.errorMessage ?? "Job failed" };
+  }
+  reply.code(202).send(body);
+}
+
 export function registerReviewRoutes(app: FastifyInstance): void {
   app.post("/v1/reviews", async (request, reply) => {
     const parsed = reviewBodySchema.safeParse(request.body);
@@ -59,7 +130,9 @@ export function registerReviewRoutes(app: FastifyInstance): void {
       return;
     }
 
-    const id = randomUUID();
+    const idempotencyKey = parseIdempotencyKeyHeader(request.headers["idempotency-key"]);
+    const bodyHash = idempotencyKey ? computeBodyHash(request.body) : undefined;
+
     const inputBytes = Buffer.byteLength(diff, "utf8");
     const contentHash = computeContentHash(diff, options);
     // Chunk count is a pure function of the diff bytes (file-boundary split
@@ -71,17 +144,49 @@ export function registerReviewRoutes(app: FastifyInstance): void {
     // twice. Only the count is needed here, not the chunk contents.
     const chunks = chunkDiff(diff).length;
 
-    await insertJob(app.pool, {
-      id,
-      provider: options.provider,
-      diff,
-      options,
-      contentHash,
-      inputBytes,
-      chunks,
-    });
+    // Idempotency-Key lookup and cache lookup are independent of each other
+    // (the latter needs only contentHash, computed above) — run them
+    // concurrently rather than as two sequential round trips.
+    const [idempotencyResolution, cacheEntry] = await Promise.all([
+      idempotencyKey && bodyHash ? resolveIdempotencyKey(app, idempotencyKey, bodyHash) : Promise.resolve(null),
+      getCacheEntry(app.pool, contentHash),
+    ]);
 
-    reply.code(202).send({ jobId: id, status: "queued" });
+    if (idempotencyResolution) {
+      sendIdempotencyResolution(reply, idempotencyResolution);
+      return;
+    }
+
+    const id = randomUUID();
+    const newJob = { id, provider: options.provider, diff, options, contentHash, inputBytes, chunks };
+    const idempotencyWrite: IdempotencyWrite | undefined =
+      idempotencyKey && bodyHash ? { key: idempotencyKey, bodyHash } : undefined;
+
+    try {
+      if (cacheEntry) {
+        // Cache lookup is independent of any Idempotency-Key: a
+        // byte-identical {diff, options} short-circuits straight to a
+        // 'done' job with no worker involvement, regardless of whether a
+        // key was supplied.
+        await insertCachedJob(app.pool, newJob, cacheEntry.findings, idempotencyWrite);
+      } else {
+        await insertJob(app.pool, newJob, idempotencyWrite);
+      }
+    } catch (err) {
+      if (err instanceof IdempotencyKeyRace && idempotencyKey && bodyHash) {
+        // Another request with the same key committed between our lookup
+        // and our insert — resolve against whichever record actually won,
+        // exactly as if we'd found it on the first lookup.
+        const resolution = await resolveIdempotencyKey(app, idempotencyKey, bodyHash);
+        if (resolution) {
+          sendIdempotencyResolution(reply, resolution);
+          return;
+        }
+      }
+      throw err;
+    }
+
+    reply.code(202).send({ jobId: id, status: cacheEntry ? "done" : "queued" });
   });
 
   app.get<{ Params: { jobId: string } }>("/v1/reviews/:jobId", async (request, reply) => {

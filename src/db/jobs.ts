@@ -1,7 +1,19 @@
 import type { Pool } from "pg";
 import type { Finding } from "../findings";
 import type { ProviderName } from "../providers";
-import { insertJobEvent, insertJobEvents } from "./jobEvents";
+import { insertJobEvent, insertJobEvents, type JobEventType } from "./jobEvents";
+import { insertCacheEntry } from "./cache";
+
+// TODO(reuse): insertJob/insertCachedJob/claimQueuedJobs/markJobDone/
+// markJobFailed each hand-roll their own connect/BEGIN/COMMIT/catch-ROLLBACK/
+// finally-release wrapper — a shared `withTransaction(pool, fn)` helper would
+// collapse this to one implementation instead of five. Related: this file's
+// idempotency_keys race handling (catch a specific unique-violation, throw a
+// typed error) and cache.ts's insertCacheEntry (ON CONFLICT DO NOTHING) solve
+// the same "two writers, same key" shape two different ways, mainly because
+// idempotency needs to know *which* writer won (to replay that job) while
+// caching only needs to discard the loser — worth converging on one
+// documented pattern if a third dedup-shaped table shows up.
 
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
@@ -21,6 +33,7 @@ export interface JobRow {
   status: JobStatus;
   diff: string;
   options: JobOptions;
+  contentHash: string;
   findings: Finding[] | null;
   usageInputBytes: number;
   usageChunks: number;
@@ -39,15 +52,35 @@ export interface NewJob {
   chunks: number;
 }
 
-// TODO(reuse): JobRow/JobRowDb/mapRow re-declare the 5 fields that don't
-// change name (id/status/diff/options/findings) three times over; only the
-// usage_*/error_* fields actually need snake->camel mapping. SQL column
-// aliasing (SELECT ... AS "usageInputBytes") would collapse this to one type.
+export interface IdempotencyWrite {
+  key: string;
+  bodyHash: string;
+}
+
+// Thrown when two concurrent requests race on the same Idempotency-Key: the
+// unique constraint on idempotency_keys.key lets Postgres itself resolve who
+// wins, rather than a check-then-insert race in application code. The caller
+// (the route handler) catches this and re-resolves against whichever record
+// actually landed — either replaying that job or reporting 409, exactly as
+// if it had been found on the very first lookup. The original Postgres error
+// is kept as `cause` so a misclassification (see isIdempotencyKeyViolation)
+// is still diagnosable rather than silently discarded.
+export class IdempotencyKeyRace extends Error {
+  constructor(cause: unknown) {
+    super("Idempotency-Key race: another request committed first", { cause });
+  }
+}
+
+// TODO(reuse): JobRow/JobRowDb/mapRow re-declare fields that don't change
+// name three times over; only the usage_*/error_*/content_hash fields
+// actually need snake->camel mapping. SQL column aliasing
+// (SELECT ... AS "usageInputBytes") would collapse this to one type.
 interface JobRowDb {
   id: string;
   status: JobStatus;
   diff: string;
   options: JobOptions;
+  content_hash: string;
   findings: Finding[] | null;
   usage_input_bytes: number;
   usage_chunks: number;
@@ -62,6 +95,7 @@ function mapRow(row: JobRowDb): JobRow {
     status: row.status,
     diff: row.diff,
     options: row.options,
+    contentHash: row.content_hash,
     findings: row.findings,
     usageInputBytes: row.usage_input_bytes,
     usageChunks: row.usage_chunks,
@@ -71,10 +105,25 @@ function mapRow(row: JobRowDb): JobRow {
   };
 }
 
-// Job creation and its first job_event (status: queued) are written in one
-// transaction — a job row can never exist without the event a stream
-// replay would need to explain how it started.
-export async function insertJob(pool: Pool, job: NewJob): Promise<void> {
+// Checks *which* constraint produced a Postgres unique-violation (23505),
+// not just the error code — insertJob/insertCachedJob's transaction also
+// inserts into `jobs` (uuid primary key), so a bare code check would
+// misclassify any other unique violation in that transaction as an
+// idempotency-key race and silently discard the real error.
+function isIdempotencyKeyViolation(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "constraint" in err &&
+    (err as { constraint: unknown }).constraint === "idempotency_keys_pkey"
+  );
+}
+
+// Job creation, its first job_event (status: queued), and — if an
+// Idempotency-Key was supplied — the idempotency_keys row are all written in
+// one transaction: a job can never exist without the event a stream replay
+// would need, and a key can never point at a job that failed to commit.
+export async function insertJob(pool: Pool, job: NewJob, idempotency?: IdempotencyWrite): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -84,9 +133,78 @@ export async function insertJob(pool: Pool, job: NewJob): Promise<void> {
       [job.id, job.provider, job.diff, JSON.stringify(job.options), job.contentHash, job.inputBytes, job.chunks],
     );
     await insertJobEvent(client, job.id, "status", { status: "queued" });
+    if (idempotency) {
+      await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
+        idempotency.key,
+        job.id,
+        idempotency.bodyHash,
+      ]);
+    }
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");
+    if (idempotency && isIdempotencyKeyViolation(err)) {
+      throw new IdempotencyKeyRace(err);
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// The cache-hit path: writes a job that's already 'done' — full event
+// sequence (queued -> running -> finding(s) -> done) included — in one
+// transaction, with no worker involvement at all. All events go through a
+// single insertJobEvents batch call rather than one write per event: this is
+// the hot path for repeated/duplicate submissions (the case caching exists
+// to make cheap), so it's exactly where holding a pooled connection across
+// N unbatched round trips would be most counterproductive. Same
+// IdempotencyKeyRace handling as insertJob, since a cache-hit submission can
+// carry an Idempotency-Key too.
+export async function insertCachedJob(
+  pool: Pool,
+  job: NewJob,
+  findings: Finding[],
+  idempotency?: IdempotencyWrite,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO jobs (id, status, provider, diff, options, content_hash, findings, usage_input_bytes, usage_chunks, usage_cache_hit, finished_at)
+       VALUES ($1, 'done', $2, $3, $4, $5, $6, $7, $8, true, now())`,
+      [
+        job.id,
+        job.provider,
+        job.diff,
+        JSON.stringify(job.options),
+        job.contentHash,
+        JSON.stringify(findings),
+        job.inputBytes,
+        job.chunks,
+      ],
+    );
+    const usage = { inputBytes: job.inputBytes, chunks: job.chunks, cacheHit: true };
+    const events: Array<{ eventType: JobEventType; payload: unknown }> = [
+      { eventType: "status", payload: { status: "queued" } },
+      { eventType: "status", payload: { status: "running" } },
+      ...findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
+      { eventType: "done", payload: { total: findings.length, usage } },
+    ];
+    await insertJobEvents(client, job.id, events);
+    if (idempotency) {
+      await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
+        idempotency.key,
+        job.id,
+        idempotency.bodyHash,
+      ]);
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    if (idempotency && isIdempotencyKeyViolation(err)) {
+      throw new IdempotencyKeyRace(err);
+    }
     throw err;
   } finally {
     client.release();
@@ -143,30 +261,46 @@ export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow
   }
 }
 
-// Writes the jobs-row update and every corresponding job_event (one
-// `finding` event per finding actually returned, then a terminal `done`
-// event) in one transaction, so an SSE replay can never observe a job
-// marked done with some of its events missing.
+// Writes the jobs-row update and every corresponding job_event in one
+// transaction, so an SSE replay can never observe a job marked done with
+// some of its events missing. The cache_entries write is deliberately
+// *not* in this transaction (see below) — it's a separate, best-effort step.
 export async function markJobDone(pool: Pool, id: string, findings: Finding[], usage: Usage): Promise<void> {
   const client = await pool.connect();
+  let contentHash: string | undefined;
   try {
     await client.query("BEGIN");
-    await client.query(`UPDATE jobs SET status = 'done', findings = $2, finished_at = now() WHERE id = $1`, [
-      id,
-      JSON.stringify(findings),
-    ]);
+    const updated = await client.query<{ content_hash: string }>(
+      `UPDATE jobs SET status = 'done', findings = $2, finished_at = now() WHERE id = $1 RETURNING content_hash`,
+      [id, JSON.stringify(findings)],
+    );
     await insertJobEvents(
       client,
       id,
       findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
     );
     await insertJobEvent(client, id, "done", { total: findings.length, usage });
+    contentHash = updated.rows[0]?.content_hash;
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
   } finally {
     client.release();
+  }
+
+  // Populating the cache is an optimization for *future* submissions, not
+  // part of what makes *this* job's outcome correct — it must never be able
+  // to turn an already-successful review into a reported failure. Kept
+  // outside the transaction above and best-effort: if it fails, the only
+  // consequence is that the next identical submission reprocesses instead of
+  // cache-hitting, which is correct (if slower), not wrong.
+  if (contentHash) {
+    try {
+      await insertCacheEntry(pool, contentHash, findings, usage.inputBytes, usage.chunks);
+    } catch (err) {
+      console.error(`markJobDone: failed to populate cache_entries for job ${id}`, err);
+    }
   }
 }
 
