@@ -53,6 +53,28 @@ describe("worker", () => {
     }
   });
 
+  it("still picks up a freshly-submitted job promptly after the poll interval has backed off from idling", async () => {
+    // Black-box wiring check to go with nextPollInterval's own unit tests
+    // (processJob.test.ts): starts the worker against an empty queue and
+    // lets it idle long enough for the backoff to grow well past its base
+    // interval, then confirms a job submitted at that point still completes
+    // quickly — catching a broken cap, an inverted reset condition, or the
+    // reset never firing, none of which nextPollInterval's unit tests alone
+    // prove are actually wired into the running tick() loop.
+    const worker = startWorker(pool);
+    try {
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const id = await insertTestJob("--- a/a.ts\n+++ b/a.ts\n@@ -0,0 +1,1 @@\n+console.log(1);\n");
+      const start = Date.now();
+      await waitUntil(async () => (await getJobById(pool, id))?.status === "done", 4000);
+
+      expect(Date.now() - start).toBeLessThan(4000);
+    } finally {
+      await worker.stop();
+    }
+  }, 15000);
+
   it("never leaves a job stuck 'running' after stop() resolves, even under immediate shutdown", async () => {
     // Regression test for a shutdown race: stop() must not just snapshot
     // in-flight jobs, but wait for whatever tick is *currently* claiming, so

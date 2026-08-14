@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { errorEnvelope } from "../errors";
 import { computeContentHash, computeBodyHash } from "../contentHash";
-import { chunkDiff } from "../chunking";
+import { countChunks } from "../chunking";
 import {
   insertJob,
   insertCachedJob,
@@ -111,8 +111,23 @@ function sendIdempotencyResolution(reply: FastifyReply, resolution: IdempotencyR
   reply.code(202).send(body);
 }
 
+// Route-scoped onRequest hook (not a global one, unlike auth) so GETs never
+// touch the rate limiter at all — checked before body parsing, so an
+// over-budget request never pays the cost of parsing/validating a payload
+// it's about to be rejected for anyway.
+async function checkRateLimit(app: FastifyInstance, reply: FastifyReply): Promise<void> {
+  const result = app.rateLimiter.tryConsume();
+  if (result.allowed) {
+    return;
+  }
+  reply
+    .code(429)
+    .header("Retry-After", String(result.retryAfterSeconds))
+    .send(errorEnvelope("rate_limited", "Rate limit exceeded — retry after the indicated delay"));
+}
+
 export function registerReviewRoutes(app: FastifyInstance): void {
-  app.post("/v1/reviews", async (request, reply) => {
+  app.post("/v1/reviews", { onRequest: (_request, reply) => checkRateLimit(app, reply) }, async (request, reply) => {
     const parsed = reviewBodySchema.safeParse(request.body);
     if (!parsed.success) {
       reply.code(422).send(errorEnvelope("invalid_diff", "diff is required and must be a string"));
@@ -137,12 +152,11 @@ export function registerReviewRoutes(app: FastifyInstance): void {
     const contentHash = computeContentHash(diff, options);
     // Chunk count is a pure function of the diff bytes (file-boundary split
     // at LIMITS.chunkBytes) — computable immediately, no need to wait for
-    // the worker to actually process the job.
-    // TODO(efficiency): this runs the full file-boundary split now just for
-    // .length, and runReview() (in the worker) does it again from scratch
-    // during actual processing — every submission splits the whole diff
-    // twice. Only the count is needed here, not the chunk contents.
-    const chunks = chunkDiff(diff).length;
+    // the worker to actually process the job. countChunks() shares its
+    // boundary logic with chunkDiff() (which the worker calls later, via
+    // runReview(), for the actual chunk content) but never builds the chunk
+    // strings themselves, since only the count is needed here.
+    const chunks = countChunks(diff);
 
     // Idempotency-Key lookup and cache lookup are independent of each other
     // (the latter needs only contentHash, computed above) — run them

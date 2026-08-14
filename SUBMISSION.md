@@ -218,6 +218,65 @@ approved fixing:
   — kept here as the concrete example of a finding I scrutinized rather than
   accepted outright.
 
+### Hardening ahead of Phase 7 (rate limiting): four fixes from a second review pass
+
+Before starting the rate-limiting phase, I asked Claude Code to sweep the
+codebase's own TODO comments for anything that could plausibly interact with
+a load test — since Phase 7 is specifically about proving "never 5xx under
+load," this seemed like the moment those TODOs would actually get exercised
+for the first time. It flagged four: a `SELECT *` pulling the full diff (up
+to 1 MiB) on every polling `GET`, a SELECT-then-UPDATE claim path holding a
+connection open across two round trips, fixed-interval worker polling paying
+for a full claim transaction five times a second even when the queue was
+empty, and an O(n²) chunk-packing loop that also ran twice per submission. I
+separately got an unsolicited recommendation from another AI tool flagging
+the same four issues almost exactly — a useful independent check, since it
+converged on the same diagnosis (connection-pool pressure and event-loop
+blocking) from a fresh read of the code. I compared the two, approved fixing
+all four, and had Claude Code implement them: `getJobById` now selects an
+explicit column list excluding `diff`; `claimQueuedJobs` collapsed to one
+`UPDATE ... RETURNING` statement; the worker backs off its poll interval
+(capped at 2s) when the queue is confirmed empty, resetting the moment
+there's real work; and `chunkDiff`/the new `countChunks` share one
+packing-and-counting pass, with that packing loop itself fixed from O(n²)
+to O(n). That last one is deliberately not "the diff is now only chunked
+once per submission" — the file-boundary split that precedes packing still
+runs once at submission time (`countChunks`) and once at processing time
+(`chunkDiff`, inside the worker); only the more expensive join/materialize
+step was actually deduplicated. An early draft of this section overstated
+that as eliminating the double split entirely — caught by review, corrected
+here rather than left as a more impressive-sounding but inaccurate claim.
+Chasing the full elimination wasn't worth it regardless: the split itself is
+one linear pass proportional to diff size, well under the 1 MiB payload cap,
+not the O(n²) risk the packing loop was.
+
+Writing the single-statement claim query is what actually caught a real bug:
+Postgres does not preserve a subquery's `ORDER BY` in an `UPDATE ...
+RETURNING`'s row order, which broke this project's own FIFO-claim-order
+regression test the moment the query was rewritten — not a hypothetical
+risk, a test failure that showed up immediately. My first fix sorted the
+returned rows by `created_at` in application code before mapping; a later
+review pass pointed out that ordering guarantee could live entirely in SQL
+instead, via a `WITH claimed AS (UPDATE ... RETURNING *) SELECT * FROM
+claimed ORDER BY created_at ASC`. I approved switching to that — it's the
+same single round trip, but the guarantee is now enforced declaratively by
+Postgres rather than by a comparator someone could typo later with nothing
+catching it.
+
+The same review pass around this phase's worker changes caught one more
+real bug, independently flagged by two different review angles running in
+parallel (the same convergent-signal pattern as the Phase 0-5 bugs above):
+the new poll-interval backoff treated a caught `claimQueuedJobs` error
+identically to a confirmed-empty queue, backing the interval off toward its
+2-second cap during exactly the kind of transient DB hiccup CLAUDE.md
+already flags as the likeliest load-test failure mode — slowing retries
+down right when fast retry matters most. I approved fixing it: the backoff
+now only engages when a claim attempt affirmatively confirms zero queued
+jobs, with the decision itself pulled out into a small pure function
+(`nextPollInterval`) specifically so it has a direct unit test — the
+existing worker test couldn't have caught this, since it always succeeds on
+the very first tick, before any backoff logic ever runs.
+
 ## Scope decisions
 
 - **Single static bearer token, no per-client identity.** Auth is a shared-token

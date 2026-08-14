@@ -46,6 +46,14 @@ describe("insertJob / getJobById", () => {
     expect(job?.usageCacheHit).toBe(false);
   });
 
+  it("does not select the diff column — GET /v1/reviews/:jobId never needs it, and it can be up to 1 MiB", async () => {
+    const id = await insertTestJob();
+    const job = await getJobById(pool, id);
+
+    expect(job).not.toBeNull();
+    expect(job).not.toHaveProperty("diff");
+  });
+
   it("returns null for an unknown id", async () => {
     expect(await getJobById(pool, randomUUID())).toBeNull();
   });

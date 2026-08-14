@@ -10,10 +10,7 @@ import { parseHunkHeader } from "./providers/mock/parseDiff";
 // matters because a *removed* line whose own content starts with "-- " (a
 // Lua/SQL/Haskell-style comment, say) becomes the raw diff line "--- ..."
 // once the '-' marker is prepended — indistinguishable by prefix alone from
-// a real "--- " file-header line. An earlier version of this function did
-// exactly that naive prefix check unconditionally and silently truncated
-// the file's diff at that point, losing every added line (and finding)
-// after it — the same class of bug parseDiff.ts already had to fix once.
+// a real "--- " file-header line.
 function splitIntoFileSections(diffText: string): string[] {
   const rawLines = diffText.split("\n");
   const lines = rawLines[rawLines.length - 1] === "" ? rawLines.slice(0, -1) : rawLines;
@@ -98,6 +95,45 @@ function splitIntoFileSections(diffText: string): string[] {
   return sections.map((section) => section.join("\n"));
 }
 
+// The packing decision shared by chunkDiff and countChunks: greedily group
+// sections into a chunk until the next one would overflow maxChunkBytes,
+// with an oversized single section becoming its own chunk immediately.
+// Yields section *indices* rather than joined strings, so a count-only
+// caller (countChunks) never has to build any chunk content — and the
+// running byte total is tracked incrementally rather than by re-joining and
+// re-measuring `current` on every section.
+function* packSections(sections: string[], maxChunkBytes: number): Generator<number[]> {
+  let current: number[] = [];
+  let currentBytes = 0;
+
+  for (let i = 0; i < sections.length; i++) {
+    const sectionBytes = Buffer.byteLength(sections[i]!, "utf8");
+
+    if (sectionBytes > maxChunkBytes) {
+      if (current.length > 0) {
+        yield current;
+        current = [];
+        currentBytes = 0;
+      }
+      yield [i];
+      continue;
+    }
+
+    if (current.length > 0 && currentBytes + 1 + sectionBytes > maxChunkBytes) {
+      yield current;
+      current = [];
+      currentBytes = 0;
+    }
+
+    current.push(i);
+    currentBytes += current.length === 1 ? sectionBytes : 1 + sectionBytes;
+  }
+
+  if (current.length > 0) {
+    yield current;
+  }
+}
+
 // Splits a diff into chunks of at most `maxChunkBytes`, only on file
 // boundaries: one file's section never spans two chunks, and a single
 // file's section larger than the limit becomes its own (oversized) chunk.
@@ -110,36 +146,21 @@ export function chunkDiff(diffText: string, maxChunkBytes: number = LIMITS.chunk
   }
 
   const chunks: string[] = [];
-  let current: string[] = [];
-
-  // TODO(efficiency): re-joins and re-measures the whole `current` array on
-  // every section rather than tracking a running byte total, making packing
-  // O(n) per section (up to O(n^2) for a chunk built from many small files).
-  const currentSizeBytes = (): number => Buffer.byteLength(current.join("\n"), "utf8");
-
-  for (const section of sections) {
-    const sectionBytes = Buffer.byteLength(section, "utf8");
-
-    if (sectionBytes > maxChunkBytes) {
-      if (current.length > 0) {
-        chunks.push(current.join("\n"));
-        current = [];
-      }
-      chunks.push(section);
-      continue;
-    }
-
-    if (current.length > 0 && currentSizeBytes() + 1 + sectionBytes > maxChunkBytes) {
-      chunks.push(current.join("\n"));
-      current = [];
-    }
-
-    current.push(section);
+  for (const indices of packSections(sections, maxChunkBytes)) {
+    chunks.push(indices.map((i) => sections[i]).join("\n"));
   }
-
-  if (current.length > 0) {
-    chunks.push(current.join("\n"));
-  }
-
   return chunks;
+}
+
+// Same chunk boundaries as chunkDiff, but only the count — no chunk content
+// is ever built. POST /v1/reviews needs usage.chunks at submission time,
+// before the worker ever runs runReview() (which calls chunkDiff() itself
+// for the real content).
+export function countChunks(diffText: string, maxChunkBytes: number = LIMITS.chunkBytes): number {
+  const sections = splitIntoFileSections(diffText);
+  if (sections.length === 0) {
+    return 1;
+  }
+
+  return [...packSections(sections, maxChunkBytes)].length;
 }

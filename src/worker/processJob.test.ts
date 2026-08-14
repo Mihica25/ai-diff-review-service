@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import { processJob } from "./index";
+import { processJob, nextPollInterval } from "./index";
 import type { JobRow } from "../db/jobs";
 import * as jobsDb from "../db/jobs";
 import * as review from "../review";
@@ -86,5 +86,40 @@ describe("processJob error handling", () => {
 
     expect(jobsDb.markJobDone).toHaveBeenCalled();
     expect(jobsDb.markJobFailed).not.toHaveBeenCalled();
+  });
+});
+
+describe("nextPollInterval", () => {
+  // Regression coverage for a real bug: an earlier version backed off on
+  // *any* tick that didn't claim a job, including one where the claim
+  // attempt itself threw — indistinguishable here from "confirmedEmpty",
+  // since that's exactly the case this function must never see as such.
+  // The worker itself is responsible for computing confirmedEmpty
+  // correctly (false on a caught error); this only tests that the backoff
+  // decision built on top of that signal is correct.
+
+  it("resets to the base interval whenever the queue wasn't confirmed empty", () => {
+    expect(nextPollInterval(false, 200)).toBe(200);
+    expect(nextPollInterval(false, 2000)).toBe(200);
+  });
+
+  it("grows by the base interval each time the queue is confirmed empty", () => {
+    let interval = 200;
+    interval = nextPollInterval(true, interval);
+    expect(interval).toBe(400);
+    interval = nextPollInterval(true, interval);
+    expect(interval).toBe(600);
+  });
+
+  it("caps growth at the maximum, never exceeding it however many empty ticks occur", () => {
+    let interval = 200;
+    for (let i = 0; i < 50; i++) {
+      interval = nextPollInterval(true, interval);
+    }
+    expect(interval).toBe(2000);
+  });
+
+  it("drops straight back to the base interval from a fully backed-off state", () => {
+    expect(nextPollInterval(false, 2000)).toBe(200);
   });
 });

@@ -11,9 +11,9 @@ export interface IdempotencyRecord {
 
 // One query joining idempotency_keys -> jobs, rather than two round trips
 // (look up the key, then a separate getJobById just to read .status) — the
-// latter would also pull the full `diff` column (up to 1 MiB) via
-// getJobById's SELECT * just to discard everything but one field. The JOIN
-// also removes any need for a "job unexpectedly missing" fallback: since
+// latter would still be a second round trip pulling columns (options,
+// findings, etc.) this check never needs. The JOIN also removes any need
+// for a "job unexpectedly missing" fallback: since
 // idempotency_keys.job_id is written in the same transaction as the job row
 // (see insertJob/insertCachedJob) and is a NOT NULL FK, an INNER JOIN simply
 // cannot produce a record whose job doesn't exist.

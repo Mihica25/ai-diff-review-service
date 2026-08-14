@@ -15,8 +15,7 @@ export interface HunkHeader {
 
 // Parses a "@@ -old,oldCount +new,newCount @@" line. Exported so chunking.ts
 // can do its own hunk-bounded scan using the exact same grammar as this
-// file's own parser — a second, hand-maintained copy of this regex used to
-// exist there and drifted into a real bug (see chunkDiff's docstring).
+// file's own parser, rather than a second, separately maintained copy.
 export function parseHunkHeader(line: string): HunkHeader | null {
   const match = HUNK_HEADER.exec(line);
   if (!match?.[2]) {

@@ -1,4 +1,4 @@
-import { chunkDiff } from "./chunking";
+import { chunkDiff, countChunks } from "./chunking";
 
 // Each added line is padded to a fixed ~100 bytes so total size is a
 // predictable, reliable function of line count — short lines like "+x0"
@@ -173,5 +173,46 @@ describe("chunkDiff", () => {
     // exact byte count, is what matters here.
     expect(Buffer.byteLength(chunks[0]!, "utf8")).toBeGreaterThan(900_000);
     expect(chunks[0]).toContain("onehugefile.ts");
+  });
+});
+
+describe("countChunks", () => {
+  // countChunks shares its boundary/packing logic with chunkDiff (via
+  // packSections) specifically so these two can't drift apart — this test
+  // is the thing that actually enforces that, across every shape chunkDiff
+  // itself is tested against above: single chunk, forced split, packed
+  // small files, an oversized single file (with and without adjacent small
+  // files), plain (non-git-style) diffs, and mixed git/plain sections.
+  const cases: Array<{ name: string; diff: string; maxChunkBytes: number }> = [
+    { name: "single small file", diff: fileDiff("a.ts", 5), maxChunkBytes: 65_536 },
+    {
+      name: "two files forced apart",
+      diff: fileDiff("a.ts", 50) + fileDiff("b.ts", 50),
+      maxChunkBytes: Buffer.byteLength(fileDiff("a.ts", 50), "utf8") + 10,
+    },
+    {
+      name: "several small files packed together",
+      diff: fileDiff("a.ts", 2) + fileDiff("b.ts", 2) + fileDiff("c.ts", 2),
+      maxChunkBytes: 65_536,
+    },
+    {
+      name: "oversized file plus a small one",
+      diff: fileDiff("huge.ts", 700) + fileDiff("small.ts", 2),
+      maxChunkBytes: 65_536,
+    },
+    {
+      name: "oversized file sandwiched between small ones",
+      diff: fileDiff("a.ts", 2) + fileDiff("huge.ts", 700) + fileDiff("b.ts", 2),
+      maxChunkBytes: 65_536,
+    },
+    {
+      name: "many small files forced into several chunks",
+      diff: Array.from({ length: 20 }, (_, i) => fileDiff(`file${i}.ts`, 10)).join(""),
+      maxChunkBytes: 2000,
+    },
+  ];
+
+  it.each(cases)("matches chunkDiff's chunk count: $name", ({ diff, maxChunkBytes }) => {
+    expect(countChunks(diff, maxChunkBytes)).toBe(chunkDiff(diff, maxChunkBytes).length);
   });
 });

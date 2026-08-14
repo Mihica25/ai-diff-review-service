@@ -211,13 +211,41 @@ export async function insertCachedJob(
   }
 }
 
-export async function getJobById(pool: Pool, id: string): Promise<JobRow | null> {
-  // TODO(efficiency): SELECT * pulls the full `diff` (up to 1 MiB) on every
-  // status poll even though the response never includes it — selecting only
-  // the needed columns would matter under a client polling this frequently.
-  const result = await pool.query<JobRowDb>("SELECT * FROM jobs WHERE id = $1", [id]);
+// GET /v1/reviews/{jobId} and the SSE stream route both need the job's
+// status/findings/usage/error — never the diff itself, which the response
+// never includes but which can be up to 1 MiB. GETs are exempt from rate
+// limiting, so a client polling this frequently pays for that column's I/O
+// and allocation on every single call; excluding it here removes that cost.
+// The return type stays `Omit<JobRow, "diff">` rather than a hand-written
+// interface, so a field added to JobRow later must also be added to the
+// return-object literal below to compile. That only guards against the
+// field being silently dropped from the *response shape*, though — it
+// can't catch the raw SQL column list itself falling out of sync, since
+// pool.query<T>()'s generic is a compile-time type assertion, never checked
+// against the actual query text. A field added here still needs the SELECT
+// list, JobRowDb, and the return literal all updated together by hand.
+export async function getJobById(pool: Pool, id: string): Promise<Omit<JobRow, "diff"> | null> {
+  const result = await pool.query<Omit<JobRowDb, "diff">>(
+    `SELECT id, status, options, content_hash, findings, usage_input_bytes, usage_chunks, usage_cache_hit, error_code, error_message
+     FROM jobs WHERE id = $1`,
+    [id],
+  );
   const row = result.rows[0];
-  return row ? mapRow(row) : null;
+  if (!row) {
+    return null;
+  }
+  return {
+    id: row.id,
+    status: row.status,
+    options: row.options,
+    contentHash: row.content_hash,
+    findings: row.findings,
+    usageInputBytes: row.usage_input_bytes,
+    usageChunks: row.usage_chunks,
+    usageCacheHit: row.usage_cache_hit,
+    errorCode: row.error_code,
+    errorMessage: row.error_message,
+  };
 }
 
 // Claims up to `limit` queued jobs and flips them to 'running' inside a
@@ -230,29 +258,33 @@ export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow
     return [];
   }
 
-  // TODO(reuse/efficiency): SELECT-then-UPDATE-then-remap (with a manual
-  // `status: "running"` override, since the SELECT read the pre-update
-  // 'queued' value) could be one round trip via `UPDATE ... RETURNING *`
-  // against the SKIP LOCKED-selected id set, and would also hold the row
-  // lock for less time on the hot claim path.
+  // One round trip instead of SELECT-then-UPDATE: the inner subquery's own
+  // FOR UPDATE SKIP LOCKED does the actual claiming (locks and selects up to
+  // `limit` queued rows, letting a concurrent claimer skip past them rather
+  // than block), the UPDATE applies to exactly that id set, and the outer
+  // SELECT re-establishes FIFO order — Postgres does not preserve a
+  // subquery's ORDER BY through UPDATE ... RETURNING on its own, so the
+  // ORDER BY on the CTE's output here is what actually guarantees it,
+  // rather than a sort written by hand in application code.
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const claimed = await client.query<JobRowDb>(
-      `SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
+      `WITH claimed AS (
+         UPDATE jobs SET status = 'running', started_at = now()
+         WHERE id IN (
+           SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED
+         )
+         RETURNING *
+       )
+       SELECT * FROM claimed ORDER BY created_at ASC`,
       [limit],
     );
-    if (claimed.rows.length > 0) {
-      const ids = claimed.rows.map((row) => row.id);
-      await client.query(`UPDATE jobs SET status = 'running', started_at = now() WHERE id = ANY($1::uuid[])`, [
-        ids,
-      ]);
-      for (const row of claimed.rows) {
-        await insertJobEvent(client, row.id, "status", { status: "running" });
-      }
+    for (const row of claimed.rows) {
+      await insertJobEvent(client, row.id, "status", { status: "running" });
     }
     await client.query("COMMIT");
-    return claimed.rows.map((row) => ({ ...mapRow(row), status: "running" as const }));
+    return claimed.rows.map(mapRow);
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

@@ -5,10 +5,30 @@ import { ProviderNotImplementedError } from "../providers";
 import { runReview } from "../review";
 
 const POLL_INTERVAL_MS = 200;
-// TODO(efficiency): fixed-interval polling costs a full claim transaction
-// every tick even when the queue is empty. LISTEN/NOTIFY or an adaptive
-// backoff would remove that idle cost; not worth the complexity yet at this
-// scale/timeline.
+const MAX_POLL_INTERVAL_MS = 2000;
+// Adaptive backoff: only a tick that affirmatively confirms zero queued
+// jobs pushes the next tick out by POLL_INTERVAL_MS, capped at
+// MAX_POLL_INTERVAL_MS, so an idle queue isn't paying for a full claim
+// transaction 5 times a second indefinitely. Every other outcome — a claim
+// succeeds, the worker is saturated and doesn't even attempt to claim, or
+// the claim attempt itself errors — resets to POLL_INTERVAL_MS. The error
+// case matters: an error tells us nothing about whether jobs are actually
+// queued, so treating it the same as a confirmed-empty queue would mean a
+// transient DB hiccup (the kind CLAUDE.md already flags as the likeliest
+// load-test failure mode) slows retries down right when fast retry matters
+// most — caught by code review, since the first version of this logic did
+// exactly that. The cap is small relative to the 30s "done within 30s"
+// budget, so the worst case (a job submitted the instant after a
+// fully-backed-off tick) only adds up to 2s of latency, not a risk to that
+// budget. LISTEN/NOTIFY would remove the idle cost entirely but is more
+// complexity than this scale/timeline calls for.
+
+// Pure decision, exported for direct unit testing — no Postgres or timers
+// involved, so the backoff/cap/reset behavior can be tested exhaustively
+// without needing to provoke a real claim failure against a real database.
+export function nextPollInterval(confirmedEmpty: boolean, current: number): number {
+  return confirmedEmpty ? Math.min(current + POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS) : POLL_INTERVAL_MS;
+}
 
 export interface Worker {
   stop(): Promise<void>;
@@ -39,6 +59,7 @@ export function startWorker(pool: Pool): Worker {
   // process could exit while they're still nominally "running" in the DB
   // with nothing left to finish them.
   let currentTick: Promise<void> = Promise.resolve();
+  let pollInterval = POLL_INTERVAL_MS;
 
   async function tick(): Promise<void> {
     if (stopped) {
@@ -46,9 +67,11 @@ export function startWorker(pool: Pool): Worker {
     }
 
     const available = LIMITS.maxConcurrentJobs - inFlight.size;
+    let confirmedEmpty = false;
     if (available > 0) {
       try {
         const jobs = await claimQueuedJobs(pool, available);
+        confirmedEmpty = jobs.length === 0;
         for (const job of jobs) {
           const p = processJob(pool, job).finally(() => {
             inFlight.delete(p);
@@ -57,15 +80,18 @@ export function startWorker(pool: Pool): Worker {
         }
       } catch (err) {
         // Transient DB hiccup while claiming — log and keep polling rather
-        // than letting the worker loop die.
+        // than letting the worker loop die. confirmedEmpty deliberately
+        // stays false here: an error is not evidence the queue is empty.
         console.error("worker: claim tick failed", err);
       }
     }
 
+    pollInterval = nextPollInterval(confirmedEmpty, pollInterval);
+
     if (!stopped) {
       timer = setTimeout(() => {
         currentTick = tick();
-      }, POLL_INTERVAL_MS);
+      }, pollInterval);
     }
   }
 
