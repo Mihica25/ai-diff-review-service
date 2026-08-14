@@ -76,6 +76,21 @@ deliberately trying encoding tricks or path traversal against a protection
 mechanism — which is a different discipline from the correctness-focused
 review that ran after every phase.
 
+Gemini's review also flagged a second, lower-severity issue in the same
+area: a request with an unsupported `Content-Type` (Fastify's own
+`FST_ERR_CTP_INVALID_MEDIA_TYPE`, status `415`) fell through
+`src/server.ts`'s global error handler into its generic branch and got
+`code: "internal"` in the body — a client-error status paired with a
+server-error code, which is misleading for any client trying to branch on
+the error taxonomy. I approved fixing it: the handler now keys on Fastify's
+own `err.code` rather than bare `statusCode` (closing the exact fragility a
+TODO comment already sitting in that file had flagged — a future route
+throwing an unrelated plain 400/413 would previously have been
+misclassified) and maps the unsupported-media-type case to `invalid_json`,
+the closest fit in the contract's closed error-code taxonomy, while
+preserving the `415` status. Verified with a new regression test
+(`src/routes/reviews.test.ts`) and live against the deployed service.
+
 - **Migrations run automatically before the server starts.** The review
   flagged that Postgres migrations weren't wired into the app's start
   command — on a cloud platform with no SSH access, there's no way to
