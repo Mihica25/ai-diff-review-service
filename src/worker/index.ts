@@ -87,10 +87,11 @@ export function startWorker(pool: Pool): Worker {
 // double-failure resilience, which are awkward to provoke reliably through a
 // real Postgres instance.
 export async function processJob(pool: Pool, job: JobRow): Promise<void> {
+  const usage = { inputBytes: job.usageInputBytes, chunks: job.usageChunks, cacheHit: job.usageCacheHit };
   try {
     const findings = runReview(job.options.provider, job.diff);
     const truncated = findings.slice(0, job.options.maxFindings);
-    await markJobDone(pool, job.id, truncated);
+    await markJobDone(pool, job.id, truncated, usage);
   } catch (err) {
     // Only a deliberate, known-safe error message is ever returned to
     // clients (via GET /v1/reviews/:jobId) — anything else (a raw DB/driver
@@ -102,7 +103,7 @@ export async function processJob(pool: Pool, job: JobRow): Promise<void> {
     }
 
     try {
-      await markJobFailed(pool, job.id, "internal", message);
+      await markJobFailed(pool, job.id, "internal", message, usage);
     } catch (writeErr) {
       // If even the failure write fails (e.g. the same DB outage that broke
       // markJobDone), do not let this throw escape unhandled — that would

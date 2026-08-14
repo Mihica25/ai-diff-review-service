@@ -1,12 +1,19 @@
 import type { Pool } from "pg";
 import type { Finding } from "../findings";
 import type { ProviderName } from "../providers";
+import { insertJobEvent, insertJobEvents } from "./jobEvents";
 
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
 export interface JobOptions {
   provider: ProviderName;
   maxFindings: number;
+}
+
+export interface Usage {
+  inputBytes: number;
+  chunks: number;
+  cacheHit: boolean;
 }
 
 export interface JobRow {
@@ -64,12 +71,26 @@ function mapRow(row: JobRowDb): JobRow {
   };
 }
 
+// Job creation and its first job_event (status: queued) are written in one
+// transaction — a job row can never exist without the event a stream
+// replay would need to explain how it started.
 export async function insertJob(pool: Pool, job: NewJob): Promise<void> {
-  await pool.query(
-    `INSERT INTO jobs (id, status, provider, diff, options, content_hash, usage_input_bytes, usage_chunks, usage_cache_hit)
-     VALUES ($1, 'queued', $2, $3, $4, $5, $6, $7, false)`,
-    [job.id, job.provider, job.diff, JSON.stringify(job.options), job.contentHash, job.inputBytes, job.chunks],
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO jobs (id, status, provider, diff, options, content_hash, usage_input_bytes, usage_chunks, usage_cache_hit)
+       VALUES ($1, 'queued', $2, $3, $4, $5, $6, $7, false)`,
+      [job.id, job.provider, job.diff, JSON.stringify(job.options), job.contentHash, job.inputBytes, job.chunks],
+    );
+    await insertJobEvent(client, job.id, "status", { status: "queued" });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getJobById(pool: Pool, id: string): Promise<JobRow | null> {
@@ -84,7 +105,8 @@ export async function getJobById(pool: Pool, id: string): Promise<JobRow | null>
 // Claims up to `limit` queued jobs and flips them to 'running' inside a
 // single transaction, so two workers (or two ticks) can never claim the same
 // job — SKIP LOCKED lets concurrent claimers pass over rows already locked
-// by another in-flight transaction instead of blocking on them.
+// by another in-flight transaction instead of blocking on them. Each claimed
+// job also gets a status:running event in the same transaction.
 export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow[]> {
   if (limit <= 0) {
     return [];
@@ -107,6 +129,9 @@ export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow
       await client.query(`UPDATE jobs SET status = 'running', started_at = now() WHERE id = ANY($1::uuid[])`, [
         ids,
       ]);
+      for (const row of claimed.rows) {
+        await insertJobEvent(client, row.id, "status", { status: "running" });
+      }
     }
     await client.query("COMMIT");
     return claimed.rows.map((row) => ({ ...mapRow(row), status: "running" as const }));
@@ -118,11 +143,31 @@ export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow
   }
 }
 
-export async function markJobDone(pool: Pool, id: string, findings: Finding[]): Promise<void> {
-  await pool.query(`UPDATE jobs SET status = 'done', findings = $2, finished_at = now() WHERE id = $1`, [
-    id,
-    JSON.stringify(findings),
-  ]);
+// Writes the jobs-row update and every corresponding job_event (one
+// `finding` event per finding actually returned, then a terminal `done`
+// event) in one transaction, so an SSE replay can never observe a job
+// marked done with some of its events missing.
+export async function markJobDone(pool: Pool, id: string, findings: Finding[], usage: Usage): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`UPDATE jobs SET status = 'done', findings = $2, finished_at = now() WHERE id = $1`, [
+      id,
+      JSON.stringify(findings),
+    ]);
+    await insertJobEvents(
+      client,
+      id,
+      findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
+    );
+    await insertJobEvent(client, id, "done", { total: findings.length, usage });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // TODO(reuse): errorCode is a bare `string` here rather than the `ErrorCode`
@@ -134,9 +179,22 @@ export async function markJobFailed(
   id: string,
   errorCode: string,
   errorMessage: string,
+  usage: Usage,
 ): Promise<void> {
-  await pool.query(
-    `UPDATE jobs SET status = 'failed', error_code = $2, error_message = $3, finished_at = now() WHERE id = $1`,
-    [id, errorCode, errorMessage],
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE jobs SET status = 'failed', error_code = $2, error_message = $3, finished_at = now() WHERE id = $1`,
+      [id, errorCode, errorMessage],
+    );
+    await insertJobEvent(client, id, "status", { status: "failed", error: { code: errorCode, message: errorMessage } });
+    await insertJobEvent(client, id, "done", { total: 0, usage });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }

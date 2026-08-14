@@ -207,7 +207,11 @@ describe("GET /v1/reviews/:jobId", () => {
 
     const [job] = await claimQueuedJobs(pool, 1);
     const findings = runMockProvider(job!.diff);
-    await markJobDone(pool, jobId, findings);
+    await markJobDone(pool, jobId, findings, {
+      inputBytes: job!.usageInputBytes,
+      chunks: job!.usageChunks,
+      cacheHit: job!.usageCacheHit,
+    });
 
     const res = await app.inject({ method: "GET", url: `/v1/reviews/${jobId}`, headers: authHeaders() });
     const body = res.json();

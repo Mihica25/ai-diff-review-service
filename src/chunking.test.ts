@@ -128,4 +128,50 @@ describe("chunkDiff", () => {
     expect(chunks[0]).toContain("real added line");
     expect(chunks[0]).toContain("context");
   });
+
+  it("splits correctly on a diff that mixes git-style and plain file sections", () => {
+    // File a.ts has a full "diff --git" header; file b.ts is a bare plain
+    // unified-diff fragment with no "diff --git" line at all — a single
+    // global choice of boundary style would never recognize b.ts's "--- "
+    // as a boundary, silently merging it into a.ts's section.
+    const gitStyle = ["diff --git a/a.ts b/a.ts", "--- a/a.ts", "+++ b/a.ts", "@@ -0,0 +1,1 @@", "+a", ""].join(
+      "\n",
+    );
+    const plainStyle = ["--- a/b.ts", "+++ b/b.ts", "@@ -0,0 +1,1 @@", "+b", ""].join("\n");
+    const combined = gitStyle + plainStyle;
+
+    const chunks = chunkDiff(combined, 65_536);
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toContain("a.ts");
+    expect(chunks[0]).toContain("b.ts");
+
+    // With a limit that fits only the first file, they must split into two.
+    const split = chunkDiff(combined, Buffer.byteLength(gitStyle, "utf8") + 5);
+    expect(split).toHaveLength(2);
+    expect(split[0]).toContain("a.ts");
+    expect(split[0]).not.toContain("b.ts");
+    expect(split[1]).toContain("b.ts");
+    expect(split[1]).not.toContain("a.ts");
+  });
+
+  it("keeps a single file near the 1 MiB payload ceiling as exactly one chunk", () => {
+    // Not just "over 64 KiB" (already covered above) — specifically near the
+    // *payload* limit, the largest a single file's diff could realistically
+    // ever be. Confirms the packing loop doesn't do anything surprising
+    // (e.g. attempt to further split, or miscount) at that extreme.
+    const diff = fileDiff("onehugefile.ts", 8300); // ~945 KB
+    const bytes = Buffer.byteLength(diff, "utf8");
+    expect(bytes).toBeGreaterThan(900_000);
+    expect(bytes).toBeLessThan(1_048_576);
+
+    const chunks = chunkDiff(diff, 65_536);
+
+    expect(chunks).toHaveLength(1);
+    // A trailing newline can be dropped in the split/rejoin round trip (same
+    // harmless normalization parseDiff.ts already does) — content, not the
+    // exact byte count, is what matters here.
+    expect(Buffer.byteLength(chunks[0]!, "utf8")).toBeGreaterThan(900_000);
+    expect(chunks[0]).toContain("onehugefile.ts");
+  });
 });

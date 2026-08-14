@@ -53,6 +53,7 @@ describe("processJob error handling", () => {
       "job-1",
       "internal",
       "llm provider not yet implemented",
+      { inputBytes: 10, chunks: 1, cacheHit: false },
     );
   });
 

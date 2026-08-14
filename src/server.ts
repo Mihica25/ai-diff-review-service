@@ -7,6 +7,7 @@ import { registerAuth } from "./plugins/auth";
 import { registerHealthRoute } from "./routes/health";
 import { registerSpecRoute } from "./routes/spec";
 import { registerReviewRoutes } from "./routes/reviews";
+import { registerStreamRoute } from "./routes/stream";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -23,6 +24,7 @@ export function buildServer(pool: Pool, config: Config): FastifyInstance {
   registerHealthRoute(app);
   registerSpecRoute(app);
   registerReviewRoutes(app);
+  registerStreamRoute(app);
 
   app.setNotFoundHandler((_request, reply) => {
     reply.code(404).send(errorEnvelope("not_found", "Route not found"));

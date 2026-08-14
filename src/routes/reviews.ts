@@ -14,9 +14,12 @@ import { looksLikeUnifiedDiff } from "../providers/mock/parseDiff";
 // maxFindings falls back to the default instead of erroring — same lenient
 // spirit as "unknown body fields are ignored". `diff` is the only field the
 // contract actually defines a validation error for.
+// maxFindings is capped (not just positive) so a client can't force an
+// unbounded number of job_events rows to be written/streamed for one job —
+// 1000 is generous headroom over the documented default of 100.
 const optionsSchema = z.object({
   provider: z.enum(["mock", "llm"]).catch("mock"),
-  maxFindings: z.number().int().positive().catch(100),
+  maxFindings: z.number().int().positive().max(1000).catch(100),
 });
 
 // TODO(simplify): the outer .catch() here duplicates the inner per-field
@@ -27,6 +30,15 @@ const reviewBodySchema = z.object({
   diff: z.string(),
   options: optionsSchema.catch({ provider: "mock", maxFindings: 100 }),
 });
+
+// `jobs.id` is a Postgres `uuid` column — a non-UUID param would make a
+// lookup query itself throw ("invalid input syntax for type uuid"), which
+// has no .statusCode and would fall through to a 500 instead of 404. Shared
+// between GET /v1/reviews/:jobId and the SSE stream route so the check can't
+// drift between the two.
+export function isValidJobId(id: string): boolean {
+  return z.uuid().safeParse(id).success;
+}
 
 export function registerReviewRoutes(app: FastifyInstance): void {
   app.post("/v1/reviews", async (request, reply) => {
@@ -73,12 +85,7 @@ export function registerReviewRoutes(app: FastifyInstance): void {
   });
 
   app.get<{ Params: { jobId: string } }>("/v1/reviews/:jobId", async (request, reply) => {
-    // `jobs.id` is a Postgres `uuid` column — a non-UUID param would make the
-    // query itself throw ("invalid input syntax for type uuid"), which has no
-    // .statusCode and would fall through to a 500 instead of 404. A malformed
-    // id can never match a real job either way, so treat it the same as
-    // not-found and never let it reach the database.
-    if (!z.uuid().safeParse(request.params.jobId).success) {
+    if (!isValidJobId(request.params.jobId)) {
       reply.code(404).send(errorEnvelope("not_found", "Unknown jobId"));
       return;
     }

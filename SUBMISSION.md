@@ -18,20 +18,33 @@
   the deployed logs show `applied migration 001_init.sql` before the server
   starts listening.
 
-- **Chunking verified at real scale, not just near the 64 KiB threshold.**
-  Submitted a 907 KB diff (129 files) through the live pipeline: correctly
-  split into 15 chunks, processed end-to-end in 169ms, findings correctly
-  truncated to `maxFindings` (100) while `usage.chunks` still reported the
-  true scan count (15) — confirming the "chunks must reflect the real count
-  even when truncated" requirement against real data rather than just unit
-  tests. Separately confirmed a 1.13 MB payload gets a clean `413
-  payload_too_large`, matching the contract's 1 MiB ceiling exactly.
+- **Chunking verified at real scale, including the extremes, not just near
+  the 64 KiB threshold.** Submitted a 907 KB diff (129 files) through the
+  live pipeline: correctly split into 15 chunks, processed end-to-end in
+  169ms, findings correctly truncated to `maxFindings` (100) while
+  `usage.chunks` still reported the true scan count (15) — confirming the
+  "chunks must reflect the real count even when truncated" requirement
+  against real data rather than just unit tests. Separately confirmed a
+  1.13 MB payload gets a clean `413 payload_too_large`, matching the
+  contract's 1 MiB ceiling exactly. Also specifically tested the extreme
+  opposite case — a single file's diff at ~965 KB, right up against that
+  same payload ceiling — confirming it correctly stays exactly one
+  (oversized) chunk rather than being split or mishandled, processed in
+  253ms with the correct finding.
 
-### Code review caught 4 real bugs before they ever shipped (Phases 0-3)
+- **SSE replay verified byte-identical against the live service, not just
+  asserted by a unit test.** Connected to a finished job's stream twice over
+  HTTP and diffed the two raw responses — zero differences. Also verified
+  live tailing separately: connecting to a job's stream immediately after
+  submission (before the worker has processed it) receives status/finding/
+  done events in real time as a genuine worker processes it concurrently,
+  not just a replay of a pre-existing log.
+
+### Code review caught 8 real bugs before they ever shipped (Phases 0-5)
 
 Before committing each phase, I ran a systematic code review against the diff —
 multiple independent reasoning angles (correctness bugs, removed/regressed
-behavior, cross-file tracing) rather than a single read-through. Four real,
+behavior, cross-file tracing) rather than a single read-through. Eight real,
 reproducible bugs surfaced this way and are all fixed and tested:
 
 - **Malformed `jobId` returned 500 instead of 404.** `GET /v1/reviews/:jobId`
@@ -62,6 +75,36 @@ reproducible bugs surfaced this way and are all fixed and tested:
   deliberate, safe-to-expose error from everything else, which now gets a
   generic client-facing message while the real error is logged server-side
   only.
+- **Removed-line content misread as a file-header boundary mid-chunk.** The
+  chunker's file-boundary splitter used naive line-prefix matching (`--- `),
+  so a removed line whose own content started with `-- ` became
+  indistinguishable from a real file-header line once the diff's `-` marker
+  was prepended — silently truncating a file's diff and losing every finding
+  after that point. Fixed by making the splitter hunk-bounded, the same class
+  of fix `parseDiff.ts` already needed once — this time sharing the
+  hunk-header parser between both files so they can't drift apart again.
+- **Boundary detection picked one header style for the whole document,
+  breaking mixed-format diffs.** A single global choice between git-style and
+  plain-style file headers meant a diff mixing both (a header-less file
+  immediately after a git-style one) would silently merge the two into one
+  chunk. My first fix attempt introduced its own bug — a flag that never got
+  reset — caught by the regression test written for the fix itself, not by
+  inspection. Fixed with a state model scoped per-section instead of
+  per-document.
+- **Sequential per-finding database writes risked connection-pool exhaustion
+  under load.** `markJobDone` held one of only 10 pooled connections open
+  across N sequential awaited inserts (one per finding) — directly matching a
+  failure mode already flagged in this project's own conventions as "the
+  most plausible way to accidentally trip never 5xx under load." Fixed with a
+  single batched multi-row insert instead of N round trips, plus capping
+  `maxFindings` at 1000 (previously unbounded); verified live with 60
+  findings written and correctly replayed in one round trip.
+- **`job_events.id` silently returned as a string despite being typed
+  `number`.** Postgres returns `bigserial`/`bigint` columns as strings by
+  default; nothing had ever queried that column before this phase, so the
+  mismatch had no code path to surface through until then. Fixed with an
+  explicit type parser so runtime behavior matches the declared type;
+  confirmed live that ids render as clean integers on the wire.
 
 ## Scope decisions
 

@@ -117,7 +117,8 @@ describe("markJobDone / markJobFailed", () => {
       title: "console.log left in",
       evidence: "console.log(1);",
     };
-    await markJobDone(pool, id, [finding]);
+    const usage = { inputBytes: 10, chunks: 1, cacheHit: false };
+    await markJobDone(pool, id, [finding], usage);
 
     const job = await getJobById(pool, id);
     expect(job?.status).toBe("done");
@@ -128,7 +129,8 @@ describe("markJobDone / markJobFailed", () => {
     const id = await insertTestJob();
     await claimQueuedJobs(pool, 1);
 
-    await markJobFailed(pool, id, "internal", "llm provider not yet implemented");
+    const usage = { inputBytes: 10, chunks: 1, cacheHit: false };
+    await markJobFailed(pool, id, "internal", "llm provider not yet implemented", usage);
 
     const job = await getJobById(pool, id);
     expect(job?.status).toBe("failed");

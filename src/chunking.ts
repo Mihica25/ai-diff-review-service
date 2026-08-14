@@ -18,13 +18,16 @@ function splitIntoFileSections(diffText: string): string[] {
   const rawLines = diffText.split("\n");
   const lines = rawLines[rawLines.length - 1] === "" ? rawLines.slice(0, -1) : rawLines;
 
-  const hasGitHeaders = lines.some((line) => line.startsWith("diff --git "));
-  const isBoundaryLine = hasGitHeaders
-    ? (line: string) => line.startsWith("diff --git ")
-    : (line: string) => line.startsWith("--- ");
-
   const sections: string[][] = [];
   let current: string[] = [];
+  // True in the brief window right after a "diff --git " line, until its own
+  // "--- " pair is consumed — decided fresh per section, not once for the
+  // whole document. A single document-wide choice (git-style vs. plain)
+  // would misdetect a boundary for a diff that mixes both styles: a
+  // plain-format file (no "diff --git ") immediately after a git-style one
+  // would never be recognized as starting a new section, silently merging
+  // it into the previous file's chunk.
+  let pendingGitHeader = false;
   let inHunk = false;
   let oldRemaining = 0;
   let newRemaining = 0;
@@ -39,9 +42,26 @@ function splitIntoFileSections(diffText: string): string[] {
         current.push(line);
         continue;
       }
-      if (isBoundaryLine(line) && current.length > 0) {
-        sections.push(current);
-        current = [];
+      if (line.startsWith("diff --git ")) {
+        if (current.length > 0) {
+          sections.push(current);
+        }
+        current = [line];
+        pendingGitHeader = true;
+        continue;
+      }
+      if (line.startsWith("--- ")) {
+        if (pendingGitHeader) {
+          // This "--- " is the header pair belonging to the "diff --git "
+          // line just seen for this same section — not a new boundary.
+          pendingGitHeader = false;
+        } else if (current.length > 0) {
+          // A "--- " with no preceding "diff --git " for this section: a
+          // real boundary, whether the whole document is plain-style or
+          // this is simply the next file after a git-style one.
+          sections.push(current);
+          current = [];
+        }
       }
       current.push(line);
       continue;
@@ -49,6 +69,12 @@ function splitIntoFileSections(diffText: string): string[] {
 
     // Inside a hunk body: this line is counted against the hunk's declared
     // totals, never treated as a boundary, regardless of its content.
+    // TODO(reuse): this +/-/context counting loop is the same logic
+    // parseDiff.ts's own hunk walk uses, duplicated rather than shared (only
+    // parseHunkHeader itself was factored out) — a future change to how one
+    // of them classifies an edge-case line could silently reintroduce the
+    // exact class of chunking/parsing mismatch this file's docstring
+    // describes already having been fixed once.
     current.push(line);
     if (line.startsWith("\\")) {
       // "\ No newline at end of file" — doesn't count against either side.
