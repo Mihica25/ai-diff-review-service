@@ -2,7 +2,8 @@ import type { Pool } from "pg";
 import { processJob } from "./index";
 import type { JobRow } from "../db/jobs";
 import * as jobsDb from "../db/jobs";
-import * as providers from "../providers";
+import * as review from "../review";
+import { ProviderNotImplementedError } from "../providers";
 
 jest.mock("../db/jobs", () => ({
   ...jest.requireActual("../db/jobs"),
@@ -10,9 +11,9 @@ jest.mock("../db/jobs", () => ({
   markJobFailed: jest.fn(),
 }));
 
-jest.mock("../providers", () => ({
-  ...jest.requireActual("../providers"),
-  runProvider: jest.fn(),
+jest.mock("../review", () => ({
+  ...jest.requireActual("../review"),
+  runReview: jest.fn(),
 }));
 
 const fakePool = {} as Pool;
@@ -41,8 +42,8 @@ beforeEach(() => {
 
 describe("processJob error handling", () => {
   it("passes through the message for a known-safe error (ProviderNotImplementedError)", async () => {
-    (providers.runProvider as jest.Mock).mockImplementation(() => {
-      throw new providers.ProviderNotImplementedError("llm provider not yet implemented");
+    (review.runReview as jest.Mock).mockImplementation(() => {
+      throw new ProviderNotImplementedError("llm provider not yet implemented");
     });
 
     await processJob(fakePool, makeJob());
@@ -56,7 +57,7 @@ describe("processJob error handling", () => {
   });
 
   it("replaces an unexpected error's message with a generic one, never leaking raw details", async () => {
-    (providers.runProvider as jest.Mock).mockImplementation(() => {
+    (review.runReview as jest.Mock).mockImplementation(() => {
       throw new Error('password authentication failed for user "app"');
     });
 
@@ -68,7 +69,7 @@ describe("processJob error handling", () => {
   });
 
   it("never rejects, even if both markJobDone and markJobFailed fail", async () => {
-    (providers.runProvider as jest.Mock).mockImplementation(() => {
+    (review.runReview as jest.Mock).mockImplementation(() => {
       throw new Error("boom");
     });
     (jobsDb.markJobFailed as jest.Mock).mockRejectedValue(new Error("db is also down"));
@@ -77,7 +78,7 @@ describe("processJob error handling", () => {
   });
 
   it("does not call markJobFailed when the job completes successfully", async () => {
-    (providers.runProvider as jest.Mock).mockReturnValue([]);
+    (review.runReview as jest.Mock).mockReturnValue([]);
 
     await processJob(fakePool, makeJob());
 

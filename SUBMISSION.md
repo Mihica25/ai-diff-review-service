@@ -18,6 +18,51 @@
   the deployed logs show `applied migration 001_init.sql` before the server
   starts listening.
 
+- **Chunking verified at real scale, not just near the 64 KiB threshold.**
+  Submitted a 907 KB diff (129 files) through the live pipeline: correctly
+  split into 15 chunks, processed end-to-end in 169ms, findings correctly
+  truncated to `maxFindings` (100) while `usage.chunks` still reported the
+  true scan count (15) — confirming the "chunks must reflect the real count
+  even when truncated" requirement against real data rather than just unit
+  tests. Separately confirmed a 1.13 MB payload gets a clean `413
+  payload_too_large`, matching the contract's 1 MiB ceiling exactly.
+
+### Code review caught 4 real bugs before they ever shipped (Phases 0-3)
+
+Before committing each phase, I ran a systematic code review against the diff —
+multiple independent reasoning angles (correctness bugs, removed/regressed
+behavior, cross-file tracing) rather than a single read-through. Four real,
+reproducible bugs surfaced this way and are all fixed and tested:
+
+- **Malformed `jobId` returned 500 instead of 404.** `GET /v1/reviews/:jobId`
+  passed the raw path param straight into a Postgres `uuid` column with no
+  format check, so a non-UUID id made the query itself throw and fall through
+  to a generic 500. Three independent review passes converged on the same
+  root cause. Fixed by validating the id as a UUID before it ever reaches the
+  database, and confirmed against the live deployment.
+- **Worker shutdown race could strand a job in `running` forever.** `stop()`
+  only snapshotted the in-flight job set, so a job claimed from Postgres in
+  the exact moment shutdown began could be abandoned mid-processing — a real
+  gap given Postgres was chosen specifically for restart-durability. Two
+  review passes independently reasoned to the same race window. Fixed by
+  having `stop()` wait for the in-progress claim to finish before draining,
+  with a regression test that calls `stop()` immediately after start to
+  maximize the chance of reproducing the exact timing; a hard-crash recovery
+  gap remains and is documented as an explicit scope decision, not dropped
+  silently.
+- **A double DB failure could crash the whole worker process.** If the
+  success write failed and the fallback failure write *also* failed, the
+  second error had no handler and would propagate as an unhandled promise
+  rejection — taking down every other in-flight job, not just the one that
+  failed. Fixed by wrapping the fallback write in its own try/catch so a
+  double failure only logs, never crashes.
+- **Raw internal error text could leak to API clients.** Any unexpected
+  exception during processing stored its raw message and returned it
+  verbatim in the public `GET` response. Fixed by distinguishing the one
+  deliberate, safe-to-expose error from everything else, which now gets a
+  generic client-facing message while the real error is logged server-side
+  only.
+
 ## Scope decisions
 
 - **Single static bearer token, no per-client identity.** Auth is a shared-token

@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { errorEnvelope } from "../errors";
 import { computeContentHash } from "../contentHash";
+import { chunkDiff } from "../chunking";
 import { insertJob, getJobById } from "../db/jobs";
 import { looksLikeUnifiedDiff } from "../providers/mock/parseDiff";
 
@@ -49,6 +50,14 @@ export function registerReviewRoutes(app: FastifyInstance): void {
     const id = randomUUID();
     const inputBytes = Buffer.byteLength(diff, "utf8");
     const contentHash = computeContentHash(diff, options);
+    // Chunk count is a pure function of the diff bytes (file-boundary split
+    // at LIMITS.chunkBytes) — computable immediately, no need to wait for
+    // the worker to actually process the job.
+    // TODO(efficiency): this runs the full file-boundary split now just for
+    // .length, and runReview() (in the worker) does it again from scratch
+    // during actual processing — every submission splits the whole diff
+    // twice. Only the count is needed here, not the chunk contents.
+    const chunks = chunkDiff(diff).length;
 
     await insertJob(app.pool, {
       id,
@@ -57,7 +66,7 @@ export function registerReviewRoutes(app: FastifyInstance): void {
       options,
       contentHash,
       inputBytes,
-      chunks: 1, // no chunking yet — Phase 4
+      chunks,
     });
 
     reply.code(202).send({ jobId: id, status: "queued" });

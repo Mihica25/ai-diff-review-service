@@ -6,13 +6,29 @@ export interface AddedLine {
 }
 
 const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-// TODO(reuse): hand-duplicated from HUNK_HEADER above rather than derived
-// from it (e.g. `new RegExp(HUNK_HEADER.source, "m")`) — the two patterns
-// have to be kept in sync by hand if hunk-header tolerance ever changes.
-// Also low-confidence but worth a look: this only checks that a hunk-header
-// shaped substring exists anywhere in the body, not that it's structurally a
-// real hunk header (e.g. decoy text containing that exact shape would pass
-// this gate and then produce zero findings from the real parser).
+
+export interface HunkHeader {
+  newStart: number;
+  oldCount: number;
+  newCount: number;
+}
+
+// Parses a "@@ -old,oldCount +new,newCount @@" line. Exported so chunking.ts
+// can do its own hunk-bounded scan using the exact same grammar as this
+// file's own parser — a second, hand-maintained copy of this regex used to
+// exist there and drifted into a real bug (see chunkDiff's docstring).
+export function parseHunkHeader(line: string): HunkHeader | null {
+  const match = HUNK_HEADER.exec(line);
+  if (!match?.[2]) {
+    return null;
+  }
+  return {
+    newStart: parseInt(match[2], 10),
+    oldCount: match[1] !== undefined ? parseInt(match[1], 10) : 1,
+    newCount: match[3] !== undefined ? parseInt(match[3], 10) : 1,
+  };
+}
+
 const HUNK_HEADER_ANYWHERE = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m;
 
 // A cheap "is this even a unified diff" check for request validation — a
@@ -63,11 +79,11 @@ export function parseDiff(diffText: string): AddedLine[] {
       continue;
     }
     if (!inHunk && line.startsWith("@@")) {
-      const match = HUNK_HEADER.exec(line);
-      if (match?.[2]) {
-        newLineNum = parseInt(match[2], 10);
-        oldRemaining = match[1] !== undefined ? parseInt(match[1], 10) : 1;
-        newRemaining = match[3] !== undefined ? parseInt(match[3], 10) : 1;
+      const hunk = parseHunkHeader(line);
+      if (hunk) {
+        newLineNum = hunk.newStart;
+        oldRemaining = hunk.oldCount;
+        newRemaining = hunk.newCount;
         inHunk = true;
         hunkId++;
       }

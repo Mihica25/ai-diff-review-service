@@ -1,7 +1,8 @@
 import type { Pool } from "pg";
 import { LIMITS } from "../limits";
 import { claimQueuedJobs, markJobDone, markJobFailed, type JobRow } from "../db/jobs";
-import { runProvider, ProviderNotImplementedError } from "../providers";
+import { ProviderNotImplementedError } from "../providers";
+import { runReview } from "../review";
 
 const POLL_INTERVAL_MS = 200;
 // TODO(efficiency): fixed-interval polling costs a full claim transaction
@@ -87,7 +88,7 @@ export function startWorker(pool: Pool): Worker {
 // real Postgres instance.
 export async function processJob(pool: Pool, job: JobRow): Promise<void> {
   try {
-    const findings = runProvider(job.options.provider, job.diff);
+    const findings = runReview(job.options.provider, job.diff);
     const truncated = findings.slice(0, job.options.maxFindings);
     await markJobDone(pool, job.id, truncated);
   } catch (err) {
