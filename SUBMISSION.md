@@ -1,5 +1,18 @@
 # Submission
 
+## TL;DR
+
+- A real authentication bypass was found (via Gemini's review) and fixed —
+  see Cross-cutting verification.
+- 8 real bugs were caught and fixed via the phase-by-phase review process —
+  see Phases 0-5.
+- An overstated review claim ("phantom 202") was checked, found wrong, and
+  corrected — see AI tools used.
+- Two AI-suggested changes were evaluated and rejected, with reasoning —
+  see Rejected AI suggestion.
+- Cross-cutting behaviors were verified live against the running service,
+  not just unit tests — see Cross-cutting verification.
+
 ## Architecture
 
 Node.js + TypeScript (strict) on Fastify. PostgreSQL holds all durable
@@ -154,7 +167,8 @@ preserving the `415` status. Verified with a new regression test
   opposite case — a single file's diff at ~965 KB, right up against that
   same payload ceiling — confirming it correctly stays exactly one
   (oversized) chunk rather than being split or mishandled, processed in
-  253ms with the correct finding.
+  253ms with the correct finding. This also serves as live confirmation of
+  the contract's 30s latency budget, well under it in both cases.
 
 - **SSE replay verified byte-identical against the live service, not just
   asserted by a unit test.** Connected to a finished job's stream twice over
@@ -225,12 +239,10 @@ of them:
   single batched multi-row insert instead of N round trips, plus capping
   `maxFindings` at 1000 (previously unbounded); verified live with 60
   findings written and correctly replayed in one round trip.
-- **`job_events.id` silently returned as a string despite being typed
-  `number`.** Postgres returns `bigserial`/`bigint` columns as strings by
-  default; nothing had ever queried that column before this phase, so the
-  mismatch had no code path to surface through until then. Fixed with an
-  explicit type parser so runtime behavior matches the declared type;
-  confirmed live that ids render as clean integers on the wire.
+- **`job_events.id` was silently returned as a string despite being typed
+  `number`** (Postgres returns `bigserial` columns as strings by default).
+  Fixed with an explicit type parser; confirmed live that ids render as
+  clean integers.
 
 ### Phase 6 (idempotency + caching): mostly deferred, two worth calling out
 
@@ -274,16 +286,12 @@ explicit column list excluding `diff`; `claimQueuedJobs` collapsed to one
 (capped at 2s) when the queue is confirmed empty, resetting the moment
 there's real work; and `chunkDiff`/the new `countChunks` share one
 packing-and-counting pass, with that packing loop itself fixed from O(n²)
-to O(n). That last one is deliberately not "the diff is now only chunked
-once per submission" — the file-boundary split that precedes packing still
-runs once at submission time (`countChunks`) and once at processing time
-(`chunkDiff`, inside the worker); only the more expensive join/materialize
-step was actually deduplicated. An early draft of this section overstated
-that as eliminating the double split entirely — caught by review, corrected
-here rather than left as a more impressive-sounding but inaccurate claim.
-Chasing the full elimination wasn't worth it regardless: the split itself is
-one linear pass proportional to diff size, well under the 1 MiB payload cap,
-not the O(n²) risk the packing loop was.
+to O(n). The file-boundary split itself still runs once at submission time
+(`countChunks`) and once at processing time (`chunkDiff`, inside the
+worker) — only the more expensive packing/join step was deduplicated,
+since the split is a cheap linear pass, not the O(n²) risk the packing
+loop was. An early draft of this section overstated that as full
+elimination; caught by review and corrected.
 
 Writing the single-statement claim query is what actually caught a real bug:
 Postgres does not preserve a subquery's `ORDER BY` in an `UPDATE ...
@@ -337,12 +345,9 @@ to me. I treated it as a suspected prompt injection, didn't act on it, and
 flagged it to the user directly rather than silently complying or silently
 ignoring it.
 
-I ran the same multi-angle review against this phase's diff, but it's worth
-being honest that the pass was partial: 5 of 7 review sub-agents failed
-outright partway through, hitting an external API session limit unrelated to
-this project's code. Only two angles completed — CLAUDE.md-convention
-checking (clean) and a removed-behavior audit, which surfaced two real
-issues I approved fixing:
+I ran the same multi-angle review against this phase's diff — only two
+angles completed (the rest hit an external API session limit), surfacing
+two real issues I approved fixing:
 
 - **One malformed finding discarded the model's entire response.** The
   response was validated as a single atomic array

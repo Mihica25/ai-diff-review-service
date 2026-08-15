@@ -2,7 +2,7 @@ import type { Category, Finding, Severity } from "../../findings";
 import { makeFindingId } from "../../findings";
 import type { AddedLine } from "./parseDiff";
 
-export interface RuleDef {
+interface RuleDef {
   id: string;
   severity: Severity;
   category: Category;
@@ -92,7 +92,7 @@ function isEmptyCatchAt(lines: AddedLine[], startIndex: number): boolean {
   return false;
 }
 
-export const MOCK_RULES: RuleDef[] = [
+const MOCK_RULES: RuleDef[] = [
   {
     id: "MOCK-001",
     severity: "critical",

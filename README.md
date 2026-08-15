@@ -8,8 +8,15 @@ replay, rate limiting) was verified.
 
 ## Running locally
 
+Requires Node.js 20+ (the `llm` provider uses native `fetch`/`AbortController`;
+developed against 20.17.0). No other system dependencies beyond Docker for
+local Postgres.
+
 ```bash
-cp .env.example .env        # fill in BEARER_TOKEN at least
+git clone https://github.com/Mihica25/ai-diff-review-service.git && cd ai-diff-review-service
+cp .env.example .env        # fill in BEARER_TOKEN at least — any string works
+                             # locally, it's just compared against the
+                             # Authorization header, not validated externally
 docker compose up -d        # local Postgres
 npm install
 npm run migrate             # applies migrations/*.sql
@@ -61,3 +68,13 @@ runs the production build.
   generic, safe-to-expose message; the underlying error (which could include
   vendor-specific details) is logged server-side only, never returned to a
   client.
+
+## Deployment
+
+Live at `https://ai-diff-review-service-production-7bd9.up.railway.app`
+(bearer token shared separately, not in this file). Deployed on Railway.
+Migrations run automatically on every boot — `src/index.ts` calls the same
+migration logic `npm run migrate` uses before the server starts listening —
+so a fresh deploy needs no manual database setup. A scheduled GitHub Actions
+workflow (`.github/workflows/keepalive.yml`) pings `/health` every 10
+minutes through the scoring window as an uptime heartbeat.
