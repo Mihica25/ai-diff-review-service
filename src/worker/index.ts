@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import { LIMITS } from "../limits";
 import { claimQueuedJobs, markJobDone, markJobFailed, type JobRow } from "../db/jobs";
-import { ProviderNotImplementedError } from "../providers";
+import { LlmProviderError, type LlmConfig } from "../providers";
 import { runReview } from "../review";
 
 const POLL_INTERVAL_MS = 200;
@@ -46,7 +46,7 @@ export interface Worker {
 // that durability only holds for 'queued' jobs today, not ones already
 // in flight at the moment of a crash. Worth a staleness-based reclaim query
 // with more time; out of scope for now given how fast mock jobs complete.
-export function startWorker(pool: Pool): Worker {
+export function startWorker(pool: Pool, llmConfig?: LlmConfig): Worker {
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
   const inFlight = new Set<Promise<void>>();
@@ -73,7 +73,7 @@ export function startWorker(pool: Pool): Worker {
         const jobs = await claimQueuedJobs(pool, available);
         confirmedEmpty = jobs.length === 0;
         for (const job of jobs) {
-          const p = processJob(pool, job).finally(() => {
+          const p = processJob(pool, job, llmConfig).finally(() => {
             inFlight.delete(p);
           });
           inFlight.add(p);
@@ -112,17 +112,17 @@ export function startWorker(pool: Pool): Worker {
 // Exported for direct unit testing of its error-sanitization and
 // double-failure resilience, which are awkward to provoke reliably through a
 // real Postgres instance.
-export async function processJob(pool: Pool, job: JobRow): Promise<void> {
+export async function processJob(pool: Pool, job: JobRow, llmConfig?: LlmConfig): Promise<void> {
   const usage = { inputBytes: job.usageInputBytes, chunks: job.usageChunks, cacheHit: job.usageCacheHit };
   try {
-    const findings = runReview(job.options.provider, job.diff);
+    const findings = await runReview(job.options.provider, job.diff, llmConfig);
     const truncated = findings.slice(0, job.options.maxFindings);
     await markJobDone(pool, job.id, truncated, usage);
   } catch (err) {
     // Only a deliberate, known-safe error message is ever returned to
     // clients (via GET /v1/reviews/:jobId) — anything else (a raw DB/driver
     // error, for instance) is logged server-side only, never echoed back.
-    const isSafeToExpose = err instanceof ProviderNotImplementedError;
+    const isSafeToExpose = err instanceof LlmProviderError;
     const message = isSafeToExpose ? err.message : "Internal error while processing this job";
     if (!isSafeToExpose) {
       console.error(`worker: job ${job.id} failed unexpectedly`, err);

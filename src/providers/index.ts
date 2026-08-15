@@ -1,19 +1,25 @@
 import type { Finding } from "../findings";
 import { runMockProvider } from "./mock";
+import { runLlmProvider, LlmProviderError, type LlmConfig } from "./llm";
 
 export type ProviderName = "mock" | "llm";
+export type { LlmConfig };
+export { LlmProviderError };
 
-// A deliberate, safe-to-expose-to-clients failure — distinct from an
-// unexpected exception (e.g. a DB error), whose raw message must never be
-// echoed back in an API response.
-export class ProviderNotImplementedError extends Error {}
-
-// diff text -> findings[], dispatched by provider name. The llm provider
-// lands in Phase 8; requesting it today fails the job gracefully (via the
-// worker's try/catch) rather than crashing the process.
-export function runProvider(provider: ProviderName, diffText: string): Finding[] {
+// diff text -> findings[], dispatched by provider name. `llmConfig` is only
+// needed for "llm" — undefined means no credentials are configured on this
+// server, which fails the same graceful way an unreachable/erroring model
+// does (LlmProviderError), never a crash.
+export async function runProvider(
+  provider: ProviderName,
+  diffText: string,
+  llmConfig?: LlmConfig,
+): Promise<Finding[]> {
   if (provider === "mock") {
     return runMockProvider(diffText);
   }
-  throw new ProviderNotImplementedError("llm provider not yet implemented");
+  if (!llmConfig) {
+    throw new LlmProviderError("LLM provider is not configured on this server");
+  }
+  return runLlmProvider(diffText, llmConfig);
 }

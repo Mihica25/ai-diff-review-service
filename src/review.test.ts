@@ -25,12 +25,12 @@ function makeFile(index: number): string {
 }
 
 describe("runReview vs unchunked mock scan", () => {
-  it("produces identical findings for a diff over 64 KiB split into multiple chunks", () => {
+  it("produces identical findings for a diff over 64 KiB split into multiple chunks", async () => {
     const bigDiff = Array.from({ length: 40 }, (_, i) => makeFile(i)).join("");
     expect(Buffer.byteLength(bigDiff, "utf8")).toBeGreaterThan(65_536);
     expect(chunkDiff(bigDiff).length).toBeGreaterThan(1);
 
-    const chunked = runReview("mock", bigDiff);
+    const chunked = await runReview("mock", bigDiff);
     const unchunked = runMockProvider(bigDiff);
 
     expect(chunked).toEqual(unchunked);
@@ -44,7 +44,7 @@ describe("runReview vs unchunked mock scan", () => {
     expect(chunked).toEqual(sorted);
   });
 
-  it("produces identical findings when a single file's own diff exceeds 64 KiB", () => {
+  it("produces identical findings when a single file's own diff exceeds 64 KiB", async () => {
     // One oversized file (its own chunk) plus ordinary files around it.
     const hugeLines = Array.from(
       { length: 700 },
@@ -66,13 +66,13 @@ describe("runReview vs unchunked mock scan", () => {
     expect(chunks.length).toBeGreaterThanOrEqual(2);
     expect(chunks.some((c) => Buffer.byteLength(c, "utf8") > 65_536)).toBe(true);
 
-    const chunked = runReview("mock", bigDiff);
+    const chunked = await runReview("mock", bigDiff);
     const unchunked = runMockProvider(bigDiff);
     expect(chunked).toEqual(unchunked);
   });
 
-  it("matches unchunked for a small diff too (single chunk, trivial case)", () => {
+  it("matches unchunked for a small diff too (single chunk, trivial case)", async () => {
     const diff = makeFile(0);
-    expect(runReview("mock", diff)).toEqual(runMockProvider(diff));
+    expect(await runReview("mock", diff)).toEqual(runMockProvider(diff));
   });
 });

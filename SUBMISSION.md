@@ -277,6 +277,65 @@ jobs, with the decision itself pulled out into a small pure function
 existing worker test couldn't have caught this, since it always succeeds on
 the very first tick, before any backoff logic ever runs.
 
+### Phase 8 (llm provider): Anthropic behind the same pipeline, two fixes from a partial review pass
+
+The `llm` provider (`src/providers/llm`) calls the Anthropic Messages API
+behind the exact same pipeline as `mock` — same chunking, ordering, caching,
+idempotency — with structured output forced via tool use (a `report_findings`
+tool with a fixed schema) rather than asking for JSON in prose, so there's no
+markdown-fence or preamble text to strip. A bounded ~20s timeout via
+`AbortController` and no retry logic match CLAUDE.md's explicit "one attempt,
+clear failure" stance for this provider; any failure — unreachable model,
+non-2xx, timeout, or an unparseable response — becomes a `failed` job with a
+generic, safe-to-expose message, never a crash and never the raw vendor error.
+The diff content is wrapped in explicit markers with an instruction to treat
+anything inside them as data, not instructions — a best-effort mitigation
+against prompt injection in the diff itself, which is a live concern here in
+a way it isn't for the mock provider's MOCK-INJ rule (that rule only
+*detects* injection-shaped text as a finding; it never feeds that text to
+anything that could act on it). This mitigation earned its place for a
+concrete reason, not just theory: during this same session, a block of text
+styled as advice to me arrived appended to unrelated tool output, instructing
+me to switch this provider to a different SDK, file, and model — unsigned,
+oddly placed, and addressed to a third party rather than written as a message
+to me. I treated it as a suspected prompt injection, didn't act on it, and
+flagged it to the user directly rather than silently complying or silently
+ignoring it.
+
+I ran the same multi-angle review against this phase's diff, but it's worth
+being honest that the pass was partial: 5 of 7 review sub-agents failed
+outright partway through, hitting an external API session limit unrelated to
+this project's code. Only two angles completed — CLAUDE.md-convention
+checking (clean) and a removed-behavior audit, which surfaced two real
+issues I approved fixing:
+
+- **One malformed finding discarded the model's entire response.** The
+  response was validated as a single atomic array
+  (`z.array(findingInputSchema)`), so one bad enum value or missing field
+  anywhere in the model's output failed validation for every other valid
+  finding in that same response — the wrong failure granularity for a
+  provider whose only value is surfacing findings. Fixed to validate each
+  finding independently, keeping the valid ones and logging/dropping only
+  the malformed ones.
+- **A response truncated at the token cap was indistinguishable from a
+  complete one.** Unlike the mock provider, whose output is exhaustive by
+  construction, a `tool_use` response cut off mid-generation can still be
+  syntactically valid JSON for a *partial* findings array — nothing was
+  checking for that. Fixed by explicitly checking the API's own
+  `stop_reason` for `"max_tokens"` and treating a truncated response as a
+  provider error rather than silently returning an incomplete result.
+
+Two things the audit raised that I judged not worth fixing at this scope:
+unbounded per-job concurrent fan-out for multi-chunk diffs on the `llm` path
+(each chunk gets its own simultaneous API call, with no cap) — realistic
+diffs are usually one chunk, and a real cap would need a small
+concurrency-limiter for a scenario that doesn't come up in the scored
+(`mock`-only) path; and the `LlmConfig` object being threaded as an optional
+parameter through four function signatures it mostly just passes along
+(`startWorker` → `processJob` → `runReview` → `runProvider`) — a real
+concern if a third provider needing its own config shape shows up, but not
+worth a config-registry abstraction for a two-provider system today.
+
 ## Scope decisions
 
 - **Single static bearer token, no per-client identity.** Auth is a shared-token

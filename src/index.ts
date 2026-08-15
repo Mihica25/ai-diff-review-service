@@ -13,7 +13,14 @@ async function main(): Promise<void> {
   await runMigrations(pool);
 
   const app = buildServer(pool, config);
-  const worker = startWorker(pool);
+  // Undefined (not an empty-string key) when ANTHROPIC_API_KEY isn't set —
+  // the service must still boot and serve the (scored) mock provider with
+  // no LLM credentials configured at all; requesting provider: "llm" then
+  // fails gracefully instead (see src/providers/llm).
+  const llmConfig = config.ANTHROPIC_API_KEY
+    ? { apiKey: config.ANTHROPIC_API_KEY, model: config.ANTHROPIC_MODEL }
+    : undefined;
+  const worker = startWorker(pool, llmConfig);
 
   const shutdown = async (): Promise<void> => {
     await worker.stop();

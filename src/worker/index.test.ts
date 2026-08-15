@@ -94,7 +94,7 @@ describe("worker", () => {
     expect(statuses).not.toContain("running");
   });
 
-  it("marks a job failed, not crashed, when the requested provider isn't implemented", async () => {
+  it("marks a job failed, not crashed, when provider: llm is requested but no LLM credentials are configured", async () => {
     const id = randomUUID();
     await insertJob(pool, {
       id,

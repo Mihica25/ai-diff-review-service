@@ -3,7 +3,7 @@ import { processJob, nextPollInterval } from "./index";
 import type { JobRow } from "../db/jobs";
 import * as jobsDb from "../db/jobs";
 import * as review from "../review";
-import { ProviderNotImplementedError } from "../providers";
+import { LlmProviderError } from "../providers";
 
 jest.mock("../db/jobs", () => ({
   ...jest.requireActual("../db/jobs"),
@@ -42,9 +42,9 @@ beforeEach(() => {
 });
 
 describe("processJob error handling", () => {
-  it("passes through the message for a known-safe error (ProviderNotImplementedError)", async () => {
+  it("passes through the message for a known-safe error (LlmProviderError)", async () => {
     (review.runReview as jest.Mock).mockImplementation(() => {
-      throw new ProviderNotImplementedError("llm provider not yet implemented");
+      throw new LlmProviderError("LLM provider is not configured on this server");
     });
 
     await processJob(fakePool, makeJob());
@@ -53,7 +53,7 @@ describe("processJob error handling", () => {
       fakePool,
       "job-1",
       "internal",
-      "llm provider not yet implemented",
+      "LLM provider is not configured on this server",
       { inputBytes: 10, chunks: 1, cacheHit: false },
     );
   });
