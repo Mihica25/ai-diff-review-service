@@ -336,6 +336,51 @@ parameter through four function signatures it mostly just passes along
 concern if a third provider needing its own config shape shows up, but not
 worth a config-registry abstraction for a two-provider system today.
 
+### Phase 9 (injection inertness): already in place since Phase 2
+
+`MOCK-INJ` (case-insensitive match on "ignore previous instructions",
+"disregard all prior", "you are now") was implemented back in the original
+rule engine, alongside MOCK-001 through MOCK-008 — there was no separate
+`MOCK-INJ`-specific pass needed at this point in the plan. What Phase 9 added
+was the explicit regression test the contract calls for: a diff with both an
+injection string and an unrelated real finding (`console.log`, MOCK-007) on
+different lines, asserting both are reported independently and neither
+affects the other — proving the injection content is treated as inert data
+(reported like any other finding, never acted on) rather than something that
+could suppress or alter other rules' output.
+
+A related, live example came up during Phase 8 rather than Phase 9: a block
+of text styled as an instruction to switch the `llm` provider to a different
+SDK/model arrived appended to unrelated tool output mid-session. I treated it
+as a suspected prompt injection, didn't act on it, and flagged it to the user
+rather than silently complying — documented in the Phase 8 section above.
+
+### Phase 10 (deploy hardening)
+
+- **`/spec` vs. real behavior, re-verified live against the deployed
+  instance after Phases 8-9 landed:** a 1,048,676-byte payload gets a clean
+  `413` at exactly the declared `maxPayloadBytes` (1 MiB) ceiling; 5
+  simultaneously-submitted jobs against `maxConcurrentJobs: 4` all reach
+  `done` with none rejected or stuck (the specific "never more than 4
+  running at once" timing assertion is covered by a dedicated local
+  integration test with direct DB access, which external polling against a
+  near-instant mock provider can't reliably catch); rate limiting
+  (`rateLimitPerMinute`/`rateLimitBurst`) was already verified live in the
+  Phase 7 write-up above.
+- **Bearer auth confirmed from independent, fresh connections** (`curl
+  --http1.1`, no cookie jar, no keep-alive reuse across requests) — correct
+  token, no token, and a wrong token all behave exactly as the contract
+  requires (404 past auth, 401, 401), ruling out any accidental reliance on
+  connection or session state.
+- **Keep-alive ping for the 48h scoring window:** a scheduled GitHub Actions
+  workflow (`.github/workflows/keepalive.yml`) pings `/health` every 10
+  minutes. Railway (unlike Render's free tier, and part of why it was chosen)
+  doesn't spin the deployment down on idle, so this isn't preventing a cold
+  start — it's an uptime heartbeat that surfaces as a failed run in the
+  Actions tab if the deployment ever actually goes down. It's self-expiring
+  (skips the ping past a hardcoded cutoff date) rather than something that
+  has to be remembered and manually disabled after submission.
+
 ## Scope decisions
 
 - **Single static bearer token, no per-client identity.** Auth is a shared-token

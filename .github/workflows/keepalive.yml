@@ -1,0 +1,40 @@
+name: Keep-alive ping
+
+# Pings /health every 10 minutes for the scoring window. Railway (unlike
+# Render's free tier) doesn't spin the deployment down on idle — this isn't
+# preventing a cold start, it's an uptime heartbeat that surfaces in the
+# Actions tab as a failed run if the deployment ever actually goes down.
+# Self-expiring past EXPIRY_DATE (below) rather than needing to be
+# remembered and manually disabled — bump that date, or delete this file
+# entirely, once the scoring window is actually over.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check expiry
+        id: expiry
+        run: |
+          EXPIRY_DATE="2026-08-29"
+          if [[ "$(date -u +%Y-%m-%d)" > "$EXPIRY_DATE" ]]; then
+            echo "Past $EXPIRY_DATE — scoring window should be over. Skipping ping (delete this workflow if it's still firing)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping /health
+        if: steps.expiry.outputs.skip != 'true'
+        run: |
+          URL="https://ai-diff-review-service-production-7bd9.up.railway.app/health"
+          STATUS=$(curl -s -o /tmp/body.json -w "%{http_code}" "$URL")
+          echo "HTTP $STATUS"
+          cat /tmp/body.json
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::/health returned $STATUS, expected 200"
+            exit 1
+          fi
