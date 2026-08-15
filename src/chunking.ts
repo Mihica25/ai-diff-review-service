@@ -1,5 +1,5 @@
 import { LIMITS } from "./limits";
-import { parseHunkHeader } from "./providers/mock/parseDiff";
+import { parseHunkHeader, classifyHunkLine } from "./providers/mock/parseDiff";
 
 // A "file section" is one file's complete diff: its header (git metadata
 // and/or the --- / +++ pair) through the end of its last hunk.
@@ -66,23 +66,20 @@ function splitIntoFileSections(diffText: string): string[] {
 
     // Inside a hunk body: this line is counted against the hunk's declared
     // totals, never treated as a boundary, regardless of its content.
-    // TODO(reuse): this +/-/context counting loop is the same logic
-    // parseDiff.ts's own hunk walk uses, duplicated rather than shared (only
-    // parseHunkHeader itself was factored out) — a future change to how one
-    // of them classifies an edge-case line could silently reintroduce the
-    // exact class of chunking/parsing mismatch this file's docstring
-    // describes already having been fixed once.
+    // classifyHunkLine is shared with parseDiff.ts's own hunk walk (see its
+    // definition) so the two can't drift apart on what counts as
+    // added/removed/context/no-newline.
     current.push(line);
-    if (line.startsWith("\\")) {
-      // "\ No newline at end of file" — doesn't count against either side.
-    } else if (line.startsWith("+")) {
+    const kind = classifyHunkLine(line);
+    if (kind === "added") {
       newRemaining--;
-    } else if (line.startsWith("-")) {
+    } else if (kind === "removed") {
       oldRemaining--;
-    } else {
+    } else if (kind === "context") {
       oldRemaining--;
       newRemaining--;
     }
+    // "no-newline-marker" doesn't count against either side.
 
     if (oldRemaining <= 0 && newRemaining <= 0) {
       inHunk = false;

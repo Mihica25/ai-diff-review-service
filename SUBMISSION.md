@@ -1,5 +1,40 @@
 # Submission
 
+## Architecture
+
+Node.js + TypeScript (strict) on Fastify. PostgreSQL holds all durable
+state: `jobs` (status/findings/usage/error), `job_events` (append-only,
+ordered — the SSE replay source of truth, never regenerated from `jobs`),
+`idempotency_keys` (key → jobId, unique), `cache_entries` (content-hash →
+result). `POST /v1/reviews` validates, hashes, checks idempotency/cache,
+inserts a `queued` job, and returns `202` immediately. An in-process worker
+polls Postgres (`SELECT ... FOR UPDATE SKIP LOCKED`, capped at 4 concurrent,
+backing off when idle) rather than an external queue — job state and claim
+state stay in one system instead of two that could drift apart. Diffs
+>64 KiB are split on file boundaries (never mid-file) before running the
+provider, then merged back through the same sort+dedup pass a single-chunk
+scan uses, so chunked and unchunked results are identical. The SSE stream
+replays `job_events` in insertion order, so two connections to a finished
+job's stream produce byte-identical output.
+
+## Provider design
+
+Reviews run through a single `runProvider(name, diffText)` dispatch. `mock`
+is a pure, deterministic function (no HTTP/DB coupling, trivial to unit
+test) implementing the MOCK-001–008 + MOCK-INJ rule table exactly. `llm`
+calls the Anthropic Messages API behind the identical chunking/ordering/
+caching pipeline, forcing structured output via tool-use (a
+`report_findings` tool) instead of parsing JSON out of prose. Both return
+the same `Finding[]` shape, so nothing downstream — chunk merging, caching,
+SSE — needs to know which provider ran. `llm` follows a strict "one attempt,
+bounded timeout, no retry" stance: a ~20s `AbortController` timeout,
+per-finding validation (one malformed finding doesn't discard the rest of
+the response), and every failure mode (unreachable, non-2xx, timeout,
+truncated response) becomes a `failed` job with a generic message — never a
+crash, never a leaked vendor detail. Credentials are entirely server-side
+env vars; the service boots and serves `mock` correctly with none of them
+configured at all.
+
 ## AI tools used
 
 Claude Code (Sonnet 5) was used throughout — for implementation across every
@@ -381,6 +416,31 @@ rather than silently complying — documented in the Phase 8 section above.
   (skips the ping past a hardcoded cutoff date) rather than something that
   has to be remembered and manually disabled after submission.
 
+## Rejected AI suggestion
+
+Every AI suggestion proposed and rejected during this project is logged in
+`REJECTED-SUGGESTIONS.md` as it happened, not reconstructed at submission
+time. The clearest example: an external AI code review tool suggested
+replacing the Postgres `SELECT ... FOR UPDATE SKIP LOCKED` job-claiming
+logic with `p-queue`, an in-memory concurrency limiter, framing the Postgres
+approach as unnecessarily complex manual bookkeeping. Rejected because
+`p-queue` holds no state on disk — job status still has to live in Postgres
+regardless (`GET /v1/reviews/{jobId}` and SSE replay both require it) — so
+it wouldn't replace the claiming logic, it would sit on top as a second,
+unsynced source of truth. Worse, a process restart mid-job would leave
+`p-queue`'s in-memory state gone while Postgres still shows `status:
+'running'` forever, with nothing to reconcile it — an orphaned-job bug the
+current design doesn't have, since `FOR UPDATE SKIP LOCKED` claiming already
+is the crash-safe state machine. It also walked back a decision this
+project already makes deliberately: no external queue system, Postgres
+row-claiming is enough at `maxConcurrentJobs=4`. A second, similar case —
+detailed step-by-step instructions to swap the hand-built rate limiter for
+`@fastify/rate-limit` — is logged the same way, rejected because the
+plugin's default fixed-window store reintroduces a boundary-burst artifact
+the current continuous-refill token bucket was specifically built to avoid,
+and its default per-IP keying would have silently contradicted the
+service-wide rate-limit budget documented below.
+
 ## Scope decisions
 
 - **Single static bearer token, no per-client identity.** Auth is a shared-token
@@ -389,6 +449,28 @@ rather than silently complying — documented in the Phase 8 section above.
   (4 workers) are service-wide budgets, not per-client, since the contract
   defines one tenant, not many. Adding per-client isolation (separate tokens,
   separate quotas) would be solving a problem the contract doesn't pose.
+- **No external queue/broker.** Postgres row-claiming (`SELECT ... FOR
+  UPDATE SKIP LOCKED`) is enough at `maxConcurrentJobs=4` — see the rejected
+  `p-queue` suggestion above for why an in-memory alternative would actually
+  be worse, not simpler.
+- **No retry/backoff for the `llm` provider.** One attempt, a bounded ~20s
+  timeout, clear failure. A hang (not just an error) would otherwise occupy
+  one of only 4 worker slots for the rest of the scoring window.
+- **No crash-recovery for jobs already claimed at the moment of a hard
+  process crash.** `stop()` handles a clean shutdown correctly (waits for
+  in-flight jobs), but nothing re-claims a `running` row left behind by a
+  crash that skips `stop()` entirely. Durability holds for `queued` jobs
+  today, not ones already in flight — worth a staleness-based reclaim query
+  with more time.
+- **No per-job concurrency cap for multi-chunk `llm` diffs.** Each chunk
+  fires its own simultaneous API call with no limiter. Realistic diffs are
+  almost always a single chunk, and this doesn't touch the scored
+  (`mock`-only) path at all.
+- **No provider-config registry.** `LlmConfig` is threaded as an optional
+  parameter through a handful of call sites rather than a generalized
+  per-provider config abstraction — worth revisiting if a third provider
+  with its own credential shape ever shows up, not worth building for a
+  two-provider system today.
 
 ## What I'd do next with more time
 
@@ -398,3 +480,22 @@ rather than silently complying — documented in the Phase 8 section above.
   token character-by-character. For this project's scope I judged it an
   acceptable simplification, not worth fixing now, but a production version
   of this service should use `crypto.timingSafeEqual` for that comparison.
+- **Crash-recovery for jobs already claimed at the moment of a hard process
+  crash.** `stop()` handles a clean shutdown correctly, but nothing re-claims
+  a `running` row left behind by a crash that skips `stop()` entirely. Not a
+  quick fix: it needs a staleness threshold (how long is "probably dead," not
+  just "slow"), a reclaim query built around that threshold, and careful
+  handling of the race between a genuinely dead worker and one that's simply
+  still working a large job — reclaiming too eagerly risks two workers
+  processing the same job at once, which the current `SKIP LOCKED` design
+  otherwise makes impossible.
+- **`GET /v1/reviews/{jobId}`'s error field via `errorEnvelope()`.** The
+  handler builds `body.error = {code, message}` by hand instead of reusing
+  the shared `errorEnvelope()` helper used everywhere else. Not a one-line
+  swap, though: `errorEnvelope()` returns a *full* envelope
+  (`{error: {code, message}}`), not the bare pair needed here, since it gets
+  embedded inside a larger response alongside `jobId`/`status`/`findings`/
+  `usage`. Doing this cleanly also means tightening `JobRow.errorCode` from
+  `string | null` to `ErrorCode | null` first (the read-path counterpart to
+  the write-path type already tightened on `markJobFailed`), so a small
+  design decision, not a mechanical one.

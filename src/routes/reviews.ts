@@ -31,13 +31,16 @@ const optionsSchema = z.object({
   maxFindings: z.number().int().positive().max(1000).catch(100),
 });
 
-// TODO(simplify): the outer .catch() here duplicates the inner per-field
-// .catch() defaults in optionsSchema (reachable when `options` itself isn't
-// an object, e.g. `options: "bad"`). Two spots to keep in sync if a default
-// ever changes; worth deriving one from the other.
+// Derived by parsing `{}` through optionsSchema itself (triggering both
+// fields' own per-field .catch()) rather than a second, hand-written
+// literal — the outer fallback (reachable when `options` itself isn't an
+// object, e.g. `options: "bad"`) can't drift from the inner per-field
+// defaults, since it's now computed from the same schema instead of copied.
+const DEFAULT_OPTIONS = optionsSchema.parse({});
+
 const reviewBodySchema = z.object({
   diff: z.string(),
-  options: optionsSchema.catch({ provider: "mock", maxFindings: 100 }),
+  options: optionsSchema.catch(DEFAULT_OPTIONS),
 });
 
 // `jobs.id` is a Postgres `uuid` column — a non-UUID param would make a
@@ -200,7 +203,13 @@ export function registerReviewRoutes(app: FastifyInstance): void {
       throw err;
     }
 
-    reply.code(202).send({ jobId: id, status: cacheEntry ? "done" : "queued" });
+    // Always "queued" here, even on a cache hit whose job is already
+    // 'done' in the DB — the contract's literal 202 shape is exactly
+    // {jobId, status: "queued"}, with no documented cache-hit variant. The
+    // "this was already computed" signal belongs on the GET response's
+    // usage.cacheHit field (and its immediately-"done" status there), not
+    // on this response.
+    reply.code(202).send({ jobId: id, status: "queued" });
   });
 
   app.get<{ Params: { jobId: string } }>("/v1/reviews/:jobId", async (request, reply) => {

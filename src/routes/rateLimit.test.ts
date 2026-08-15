@@ -1,14 +1,14 @@
-import { Pool } from "pg";
 import { buildServer } from "../server";
 import { LIMITS } from "../limits";
+import { createTestPool } from "../testUtils/testPool";
 
 const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
 const BEARER_TOKEN = "test-token";
 
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 function makeApp() {
-  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN });
+  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN, ANTHROPIC_MODEL: "claude-sonnet-5" });
 }
 
 function authHeaders() {

@@ -1,15 +1,15 @@
-import { Pool } from "pg";
 import { buildServer } from "../server";
 import { claimQueuedJobs, markJobDone, markJobFailed } from "../db/jobs";
 import { runMockProvider } from "../providers/mock";
+import { createTestPool } from "../testUtils/testPool";
 
 const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
 const BEARER_TOKEN = "test-token";
 
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 function makeApp() {
-  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN });
+  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN, ANTHROPIC_MODEL: "claude-sonnet-5" });
 }
 
 function authHeaders(extra: Record<string, string> = {}) {
@@ -216,8 +216,12 @@ describe("caching", () => {
     expect(second.statusCode).toBe(202);
     const { jobId: secondId, status } = second.json();
     expect(secondId).not.toBe(firstId);
-    expect(status).toBe("done"); // instant — no worker ever touched this job
+    // The 202 response is always exactly {jobId, status: "queued"} per the
+    // contract's literal spec, even on a cache hit — no cache-hit variant.
+    expect(status).toBe("queued");
 
+    // The job is already 'done' in the DB, though (no worker ever touched
+    // it) — that's reported on the GET response, not the POST one.
     const getRes = await app.inject({ method: "GET", url: `/v1/reviews/${secondId}`, headers: authHeaders() });
     const body = getRes.json();
     expect(body.status).toBe("done");
@@ -251,7 +255,9 @@ describe("caching", () => {
     });
 
     for (const res of [noKey, differentKey]) {
-      expect(res.json().status).toBe("done");
+      // POST always reports "queued" (see the byte-identical-resubmission
+      // test above); the cache hit itself shows up on the GET response.
+      expect(res.json().status).toBe("queued");
       const getRes = await app.inject({ method: "GET", url: `/v1/reviews/${res.json().jobId}`, headers: authHeaders() });
       expect(getRes.json().usage.cacheHit).toBe(true);
     }

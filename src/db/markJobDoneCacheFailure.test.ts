@@ -1,15 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
 import { insertJob, markJobDone, getJobById } from "./jobs";
 import * as cache from "./cache";
+import { createTestPool } from "../testUtils/testPool";
 
 jest.mock("./cache", () => ({
   ...jest.requireActual("./cache"),
   insertCacheEntry: jest.fn(),
 }));
 
-const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 beforeEach(async () => {
   jest.clearAllMocks();

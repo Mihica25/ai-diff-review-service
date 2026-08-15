@@ -1,18 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
 import { buildServer } from "../server";
 import { claimQueuedJobs, insertJob, markJobDone, markJobFailed } from "../db/jobs";
 import { runMockProvider } from "../providers/mock";
 import { startWorker, type Worker } from "../worker";
 import { streamJobEvents } from "./stream";
+import { createTestPool } from "../testUtils/testPool";
 
 const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
 const BEARER_TOKEN = "test-token";
 
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 function makeApp() {
-  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN });
+  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN, ANTHROPIC_MODEL: "claude-sonnet-5" });
 }
 
 function authHeaders() {
@@ -249,6 +249,52 @@ describe("GET /v1/reviews/:jobId/stream", () => {
       error: { code: "internal", message: "simulated failure" },
     });
     expect(frames[3]?.data).toEqual({ total: 0, usage: { inputBytes: 10, chunks: 1, cacheHit: false } });
+  });
+
+  it("reconnecting while the job is genuinely still running replays only the events written so far, and a later fresh reconnect after completion gets the rest", async () => {
+    const app = makeApp();
+    const submit = await app.inject({
+      method: "POST",
+      url: "/v1/reviews",
+      headers: authHeaders(),
+      payload: { diff: VALID_DIFF },
+    });
+    const { jobId } = submit.json();
+
+    // Claims the job (flips it to 'running', writes the running event) but
+    // deliberately never calls markJobDone yet — a deterministic stand-in
+    // for a client reconnecting while a job is genuinely mid-flight, rather
+    // than racing a real worker's near-instant mock processing.
+    const [job] = await claimQueuedJobs(pool, 1);
+
+    // Calls streamJobEvents directly (not via the HTTP route) with a short
+    // maxStreamMs standing in for the client disconnecting on its own —
+    // the route's default maxStreamMs (60s) would otherwise make this
+    // block hang for a full minute, since this job never reaches 'done'
+    // within this call.
+    const midChunks: string[] = [];
+    await streamJobEvents(pool, jobId, (chunk) => midChunks.push(chunk), () => false, {
+      pollIntervalMs: 10,
+      heartbeatIntervalMs: 10_000,
+      maxStreamMs: 50,
+    });
+    const midFrames = parseSse(midChunks.join(""));
+    expect(midFrames.map((f) => f.event)).toEqual(["status", "status"]);
+    expect(midFrames[1]?.data).toEqual({ status: "running" });
+
+    // Now actually finish the job, and reconnect with a genuinely new
+    // connection (not the same one continuing) — it must see the complete
+    // log, not just the events written after this second connection opened.
+    const findings = runMockProvider(job!.diff);
+    await markJobDone(pool, jobId, findings, {
+      inputBytes: job!.usageInputBytes,
+      chunks: job!.usageChunks,
+      cacheHit: job!.usageCacheHit,
+    });
+
+    const afterStream = await app.inject({ method: "GET", url: `/v1/reviews/${jobId}/stream`, headers: authHeaders() });
+    const afterFrames = parseSse(afterStream.payload);
+    expect(afterFrames.map((f) => f.event)).toEqual(["status", "status", "finding", "done"]);
   });
 
   it("two concurrent clients streaming the same job both receive the full, identical event log", async () => {

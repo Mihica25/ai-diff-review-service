@@ -1,11 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
 import { insertJob, getJobById } from "../db/jobs";
 import { startWorker } from "./index";
+import { createTestPool } from "../testUtils/testPool";
 
-const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
-// TODO(reuse): see src/db/jobs.test.ts — same createPool() divergence risk.
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 async function insertTestJob(diff: string): Promise<string> {
   const id = randomUUID();

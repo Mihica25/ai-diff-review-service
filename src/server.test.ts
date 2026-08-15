@@ -10,6 +10,7 @@ function makeApp() {
     PORT: 3000,
     DATABASE_URL: "postgres://unused",
     BEARER_TOKEN,
+    ANTHROPIC_MODEL: "claude-sonnet-5",
   });
 }
 
@@ -122,6 +123,29 @@ describe("bearer auth on /v1/*", () => {
     // itself will error past that point, which is fine, that's not what's
     // under test here.
     expect(res.statusCode).not.toBe(401);
+  });
+
+  // Malformed-but-close headers: the parsing is a plain
+  // `header?.startsWith("Bearer ")` check, so anything that isn't exactly
+  // that scheme + one space + the token must fail closed, not accidentally
+  // match on a near-miss.
+  it.each<[string, string]>([
+    ["lowercase scheme", "bearer test-token"],
+    ["wrong scheme", "Basic test-token"],
+    ["scheme with no trailing space or token", "Bearer"],
+    ["scheme with trailing space but empty token", "Bearer "],
+    ["extra internal whitespace before the token", "Bearer  test-token"],
+    ["raw token with no scheme at all", "test-token"],
+    ["correct token with trailing garbage", "Bearer test-token-extra"],
+    ["correct token as a prefix of the header value", "Bearer test-tok"],
+  ])("rejects a malformed-but-close Authorization header: %s", async (_label: string, headerValue: string) => {
+    const app = makeApp();
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/reviews/some-id",
+      headers: { authorization: headerValue },
+    });
+    expect(res.statusCode).toBe(401);
   });
 });
 

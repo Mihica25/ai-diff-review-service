@@ -1,10 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
 import { claimQueuedJobs, insertJob, markJobDone, markJobFailed } from "./jobs";
 import { getJobEventsAfter } from "./jobEvents";
+import { createTestPool } from "../testUtils/testPool";
 
-const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 async function insertTestJob(): Promise<string> {
   const id = randomUUID();

@@ -28,6 +28,21 @@ export function parseHunkHeader(line: string): HunkHeader | null {
   };
 }
 
+export type HunkLineKind = "no-newline-marker" | "added" | "removed" | "context";
+
+// Classifies one line inside a hunk body. Shared by this file's own walk and
+// chunking.ts's hunk-bounded boundary scan, so a future change to what
+// counts as added/removed/context/no-newline can't drift between the two —
+// previously each file had its own copy of this same if/else chain, and a
+// second copy is exactly what let the chunker's boundary detection and this
+// file's parsing fall out of sync once already (see chunking.ts's docstring).
+export function classifyHunkLine(line: string): HunkLineKind {
+  if (line.startsWith("\\")) return "no-newline-marker";
+  if (line.startsWith("+")) return "added";
+  if (line.startsWith("-")) return "removed";
+  return "context";
+}
+
 const HUNK_HEADER_ANYWHERE = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m;
 
 // A cheap "is this even a unified diff" check for request validation — a
@@ -92,17 +107,18 @@ export function parseDiff(diffText: string): AddedLine[] {
       continue; // "diff --git", "index ...", etc.
     }
 
-    if (line.startsWith("\\")) {
+    const kind = classifyHunkLine(line);
+    if (kind === "no-newline-marker") {
       // "\ No newline at end of file" — not a real line, doesn't move counters.
       continue;
     }
-    if (line.startsWith("+")) {
+    if (kind === "added") {
       if (currentPath !== null) {
         added.push({ path: currentPath, line: newLineNum, content: line.slice(1), hunk: hunkId });
       }
       newLineNum++;
       newRemaining--;
-    } else if (line.startsWith("-")) {
+    } else if (kind === "removed") {
       oldRemaining--;
     } else {
       // Context line (starts with a space, or is malformed/blank).

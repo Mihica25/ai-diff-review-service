@@ -1,16 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
 import { claimQueuedJobs, getJobById, insertJob, markJobDone, markJobFailed } from "./jobs";
+import { createTestPool } from "../testUtils/testPool";
 
 // Integration tests against a real Postgres (the local docker-compose
 // instance) — claiming safety (FOR UPDATE SKIP LOCKED) is exactly the kind
 // of thing a mock would defeat the purpose of testing.
-const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
-
-// TODO(reuse): uses `new Pool()` directly rather than the app's own
-// createPool() (src/db/pool.ts), so test pools silently diverge from
-// production config (max size, SSL options, etc.) if that ever changes.
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 async function insertTestJob(overrides: { diff?: string; maxFindings?: number } = {}): Promise<string> {
   const id = randomUUID();

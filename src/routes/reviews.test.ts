@@ -1,16 +1,15 @@
-import { Pool } from "pg";
 import { buildServer } from "../server";
 import { claimQueuedJobs, markJobDone } from "../db/jobs";
 import { runMockProvider } from "../providers/mock";
+import { createTestPool } from "../testUtils/testPool";
 
 const DATABASE_URL = process.env["DATABASE_URL"] ?? "postgres://postgres:postgres@localhost:5433/ai_diff_review";
 const BEARER_TOKEN = "test-token";
 
-// TODO(reuse): see src/db/jobs.test.ts — same createPool() divergence risk.
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createTestPool();
 
 function makeApp() {
-  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN });
+  return buildServer(pool, { PORT: 3000, DATABASE_URL, BEARER_TOKEN, ANTHROPIC_MODEL: "claude-sonnet-5" });
 }
 
 const VALID_DIFF = "--- a/a.ts\n+++ b/a.ts\n@@ -0,0 +1,1 @@\n+console.log(1);\n";

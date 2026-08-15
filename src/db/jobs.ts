@@ -1,19 +1,31 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import type { Finding } from "../findings";
 import type { ProviderName } from "../providers";
+import type { ErrorCode } from "../errors";
 import { insertJobEvent, insertJobEvents, type JobEventType } from "./jobEvents";
 import { insertCacheEntry } from "./cache";
 
-// TODO(reuse): insertJob/insertCachedJob/claimQueuedJobs/markJobDone/
-// markJobFailed each hand-roll their own connect/BEGIN/COMMIT/catch-ROLLBACK/
-// finally-release wrapper — a shared `withTransaction(pool, fn)` helper would
-// collapse this to one implementation instead of five. Related: this file's
-// idempotency_keys race handling (catch a specific unique-violation, throw a
-// typed error) and cache.ts's insertCacheEntry (ON CONFLICT DO NOTHING) solve
-// the same "two writers, same key" shape two different ways, mainly because
-// idempotency needs to know *which* writer won (to replay that job) while
-// caching only needs to discard the loser — worth converging on one
-// documented pattern if a third dedup-shaped table shows up.
+// Shared by insertJob/insertCachedJob/claimQueuedJobs/markJobDone/
+// markJobFailed instead of each hand-rolling its own connect/BEGIN/COMMIT/
+// catch-ROLLBACK/finally-release wrapper. Callers that need to classify a
+// rolled-back error (e.g. insertJob's IdempotencyKeyRace check) still do
+// that in their own catch block, after this rethrows — rollback happens
+// exactly once, here, regardless of what the caller does with the error
+// afterward.
+async function withTransaction<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
@@ -124,31 +136,27 @@ function isIdempotencyKeyViolation(err: unknown): boolean {
 // one transaction: a job can never exist without the event a stream replay
 // would need, and a key can never point at a job that failed to commit.
 export async function insertJob(pool: Pool, job: NewJob, idempotency?: IdempotencyWrite): Promise<void> {
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    await client.query(
-      `INSERT INTO jobs (id, status, provider, diff, options, content_hash, usage_input_bytes, usage_chunks, usage_cache_hit)
-       VALUES ($1, 'queued', $2, $3, $4, $5, $6, $7, false)`,
-      [job.id, job.provider, job.diff, JSON.stringify(job.options), job.contentHash, job.inputBytes, job.chunks],
-    );
-    await insertJobEvent(client, job.id, "status", { status: "queued" });
-    if (idempotency) {
-      await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
-        idempotency.key,
-        job.id,
-        idempotency.bodyHash,
-      ]);
-    }
-    await client.query("COMMIT");
+    await withTransaction(pool, async (client) => {
+      await client.query(
+        `INSERT INTO jobs (id, status, provider, diff, options, content_hash, usage_input_bytes, usage_chunks, usage_cache_hit)
+         VALUES ($1, 'queued', $2, $3, $4, $5, $6, $7, false)`,
+        [job.id, job.provider, job.diff, JSON.stringify(job.options), job.contentHash, job.inputBytes, job.chunks],
+      );
+      await insertJobEvent(client, job.id, "status", { status: "queued" });
+      if (idempotency) {
+        await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
+          idempotency.key,
+          job.id,
+          idempotency.bodyHash,
+        ]);
+      }
+    });
   } catch (err) {
-    await client.query("ROLLBACK");
     if (idempotency && isIdempotencyKeyViolation(err)) {
       throw new IdempotencyKeyRace(err);
     }
     throw err;
-  } finally {
-    client.release();
   }
 }
 
@@ -167,47 +175,43 @@ export async function insertCachedJob(
   findings: Finding[],
   idempotency?: IdempotencyWrite,
 ): Promise<void> {
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    await client.query(
-      `INSERT INTO jobs (id, status, provider, diff, options, content_hash, findings, usage_input_bytes, usage_chunks, usage_cache_hit, finished_at)
-       VALUES ($1, 'done', $2, $3, $4, $5, $6, $7, $8, true, now())`,
-      [
-        job.id,
-        job.provider,
-        job.diff,
-        JSON.stringify(job.options),
-        job.contentHash,
-        JSON.stringify(findings),
-        job.inputBytes,
-        job.chunks,
-      ],
-    );
-    const usage = { inputBytes: job.inputBytes, chunks: job.chunks, cacheHit: true };
-    const events: Array<{ eventType: JobEventType; payload: unknown }> = [
-      { eventType: "status", payload: { status: "queued" } },
-      { eventType: "status", payload: { status: "running" } },
-      ...findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
-      { eventType: "done", payload: { total: findings.length, usage } },
-    ];
-    await insertJobEvents(client, job.id, events);
-    if (idempotency) {
-      await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
-        idempotency.key,
-        job.id,
-        idempotency.bodyHash,
-      ]);
-    }
-    await client.query("COMMIT");
+    await withTransaction(pool, async (client) => {
+      await client.query(
+        `INSERT INTO jobs (id, status, provider, diff, options, content_hash, findings, usage_input_bytes, usage_chunks, usage_cache_hit, finished_at)
+         VALUES ($1, 'done', $2, $3, $4, $5, $6, $7, $8, true, now())`,
+        [
+          job.id,
+          job.provider,
+          job.diff,
+          JSON.stringify(job.options),
+          job.contentHash,
+          JSON.stringify(findings),
+          job.inputBytes,
+          job.chunks,
+        ],
+      );
+      const usage = { inputBytes: job.inputBytes, chunks: job.chunks, cacheHit: true };
+      const events: Array<{ eventType: JobEventType; payload: unknown }> = [
+        { eventType: "status", payload: { status: "queued" } },
+        { eventType: "status", payload: { status: "running" } },
+        ...findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
+        { eventType: "done", payload: { total: findings.length, usage } },
+      ];
+      await insertJobEvents(client, job.id, events);
+      if (idempotency) {
+        await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
+          idempotency.key,
+          job.id,
+          idempotency.bodyHash,
+        ]);
+      }
+    });
   } catch (err) {
-    await client.query("ROLLBACK");
     if (idempotency && isIdempotencyKeyViolation(err)) {
       throw new IdempotencyKeyRace(err);
     }
     throw err;
-  } finally {
-    client.release();
   }
 }
 
@@ -266,9 +270,7 @@ export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow
   // subquery's ORDER BY through UPDATE ... RETURNING on its own, so the
   // ORDER BY on the CTE's output here is what actually guarantees it,
   // rather than a sort written by hand in application code.
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  return withTransaction(pool, async (client) => {
     const claimed = await client.query<JobRowDb>(
       `WITH claimed AS (
          UPDATE jobs SET status = 'running', started_at = now()
@@ -283,14 +285,8 @@ export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow
     for (const row of claimed.rows) {
       await insertJobEvent(client, row.id, "status", { status: "running" });
     }
-    await client.query("COMMIT");
     return claimed.rows.map(mapRow);
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+  });
 }
 
 // Writes the jobs-row update and every corresponding job_event in one
@@ -298,10 +294,7 @@ export async function claimQueuedJobs(pool: Pool, limit: number): Promise<JobRow
 // some of its events missing. The cache_entries write is deliberately
 // *not* in this transaction (see below) — it's a separate, best-effort step.
 export async function markJobDone(pool: Pool, id: string, findings: Finding[], usage: Usage): Promise<void> {
-  const client = await pool.connect();
-  let contentHash: string | undefined;
-  try {
-    await client.query("BEGIN");
+  const contentHash = await withTransaction(pool, async (client) => {
     const updated = await client.query<{ content_hash: string }>(
       `UPDATE jobs SET status = 'done', findings = $2, finished_at = now() WHERE id = $1 RETURNING content_hash`,
       [id, JSON.stringify(findings)],
@@ -312,14 +305,8 @@ export async function markJobDone(pool: Pool, id: string, findings: Finding[], u
       findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
     );
     await insertJobEvent(client, id, "done", { total: findings.length, usage });
-    contentHash = updated.rows[0]?.content_hash;
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+    return updated.rows[0]?.content_hash;
+  });
 
   // Populating the cache is an optimization for *future* submissions, not
   // part of what makes *this* job's outcome correct — it must never be able
@@ -336,31 +323,19 @@ export async function markJobDone(pool: Pool, id: string, findings: Finding[], u
   }
 }
 
-// TODO(reuse): errorCode is a bare `string` here rather than the `ErrorCode`
-// union already defined in src/errors.ts — importing it would let TypeScript
-// catch a typo'd/out-of-taxonomy code at the call site instead of silently
-// accepting anything.
 export async function markJobFailed(
   pool: Pool,
   id: string,
-  errorCode: string,
+  errorCode: ErrorCode,
   errorMessage: string,
   usage: Usage,
 ): Promise<void> {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  await withTransaction(pool, async (client) => {
     await client.query(
       `UPDATE jobs SET status = 'failed', error_code = $2, error_message = $3, finished_at = now() WHERE id = $1`,
       [id, errorCode, errorMessage],
     );
     await insertJobEvent(client, id, "status", { status: "failed", error: { code: errorCode, message: errorMessage } });
     await insertJobEvent(client, id, "done", { total: 0, usage });
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+  });
 }

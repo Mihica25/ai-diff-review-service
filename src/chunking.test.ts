@@ -100,6 +100,32 @@ describe("chunkDiff", () => {
     expect(chunks.length).toBeGreaterThan(1);
   });
 
+  it("packs two files together when their combined size lands exactly at maxChunkBytes, but splits them when it's one byte over", () => {
+    const a = fileDiff("a.ts", 3);
+    const b = fileDiff("b.ts", 3);
+
+    // Measure each file's actual packed-section byte size the way the
+    // packing loop itself sees it — splitIntoFileSections rebuilds each
+    // section via `.join("\n")`, which can drop a trailing newline the raw
+    // input string had, so the reconstructed section isn't necessarily the
+    // same byte length as the original string. Chunking each file alone
+    // against an effectively unlimited size yields exactly one chunk, which
+    // *is* that reconstructed section.
+    const [aAlone] = chunkDiff(a, Number.MAX_SAFE_INTEGER);
+    const [bAlone] = chunkDiff(b, Number.MAX_SAFE_INTEGER);
+    const aBytes = Buffer.byteLength(aAlone!, "utf8");
+    const bBytes = Buffer.byteLength(bAlone!, "utf8");
+
+    // packSections combines two sections with a single "\n" separator, so
+    // the combined size is aBytes + 1 + bBytes — that's the exact boundary.
+    const exactFitMax = aBytes + 1 + bBytes;
+    const exactFitChunks = chunkDiff(a + b, exactFitMax);
+    expect(exactFitChunks).toHaveLength(1);
+
+    const oneOverChunks = chunkDiff(a + b, exactFitMax - 1);
+    expect(oneOverChunks).toHaveLength(2);
+  });
+
   it("works on plain unified diffs with no 'diff --git' header", () => {
     const plain = ["--- a/a.ts", "+++ b/a.ts", "@@ -0,0 +1,1 @@", "+x", ""].join("\n");
     const chunks = chunkDiff(plain, 65_536);
