@@ -6,22 +6,14 @@ import { runReview } from "../review";
 
 const POLL_INTERVAL_MS = 200;
 const MAX_POLL_INTERVAL_MS = 2000;
-// Adaptive backoff: only a tick that affirmatively confirms zero queued
-// jobs pushes the next tick out by POLL_INTERVAL_MS, capped at
-// MAX_POLL_INTERVAL_MS, so an idle queue isn't paying for a full claim
-// transaction 5 times a second indefinitely. Every other outcome — a claim
-// succeeds, the worker is saturated and doesn't even attempt to claim, or
-// the claim attempt itself errors — resets to POLL_INTERVAL_MS. The error
-// case matters: an error tells us nothing about whether jobs are actually
-// queued, so treating it the same as a confirmed-empty queue would mean a
-// transient DB hiccup (the kind CLAUDE.md already flags as the likeliest
-// load-test failure mode) slows retries down right when fast retry matters
-// most — caught by code review, since the first version of this logic did
-// exactly that. The cap is small relative to the 30s "done within 30s"
-// budget, so the worst case (a job submitted the instant after a
-// fully-backed-off tick) only adds up to 2s of latency, not a risk to that
-// budget. LISTEN/NOTIFY would remove the idle cost entirely but is more
-// complexity than this scale/timeline calls for.
+// Backs off (up to 2s) only when a tick confirms the queue is empty;
+// every other outcome (a claim succeeds, the worker is saturated, or the
+// claim itself errors) resets to fast polling. Errors are deliberately
+// NOT treated as confirmed-empty — a DB hiccup isn't evidence the queue
+// is empty, and slowing retries down during one would hurt exactly when
+// fast retry matters most. The 2s cap stays well within the 30s latency
+// budget. LISTEN/NOTIFY would remove idle-polling cost entirely, but
+// isn't worth the added complexity at this scale.
 
 // Pure decision, exported for direct unit testing — no Postgres or timers
 // involved, so the backoff/cap/reset behavior can be tested exhaustively

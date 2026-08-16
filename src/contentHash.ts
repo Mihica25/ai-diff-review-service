@@ -21,27 +21,13 @@ export function computeContentHash(diff: string, options: ResolvedOptions): stri
   return createHash("sha256").update(canonical).digest("hex");
 }
 
-// sha256 of the raw request body, for Idempotency-Key comparison: "same key
-// + byte-identical body". Deliberately hashes the body as received (unknown
-// fields, un-resolved options and all), not the validated/defaulted shape
-// computeContentHash uses — idempotency is about literal request equality,
-// caching is about semantic {diff, options} equality, and those two
-// genuinely differ for a request that omits `options` vs. one that sends
-// `options: {}` (same resolved effect, different raw body).
-//
-// Note on "byte-identical": this hashes JSON.stringify(parsed body), not the
-// literal wire bytes — Fastify parses the body before this runs, and
-// capturing true raw bytes would need extra plugin plumbing. In practice
-// this means two requests are only treated as identical if their JSON keys
-// are also in the same order (JSON.parse preserves source key order), which
-// covers the realistic case (a client retrying literally resends the same
-// body) without the added complexity of raw-body capture.
-//
-// This and computeContentHash are both literally `sha256(JSON.stringify(x))`
-// — deliberately left as two named functions rather than one shared
-// primitive, since the whole point of the comments here is explaining *why*
-// they must stay semantically distinct; collapsing them to one generic
-// helper plus two one-line callers would bury that distinction, not clarify it.
+// sha256 of the raw request body (for Idempotency-Key's "same key +
+// byte-identical body" check), not the resolved options computeContentHash
+// above uses — idempotency needs literal request equality, caching needs
+// semantic {diff, options} equality, and those differ when `options` is
+// omitted vs. sent as `{}`. Hashes JSON.stringify(the parsed body), so two
+// requests only count as identical if their JSON keys are also in the same
+// order — a documented limitation, not an oversight.
 export function computeBodyHash(body: unknown): string {
   return createHash("sha256").update(JSON.stringify(body)).digest("hex");
 }

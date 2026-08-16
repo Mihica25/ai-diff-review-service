@@ -3,17 +3,12 @@ import { sortAndDedupeFindings } from "./findings";
 import { chunkDiff } from "./chunking";
 import { runProvider, type ProviderName, type LlmConfig } from "./providers";
 
-// Chunks the diff (file-boundary-safe, per LIMITS.chunkBytes), runs the
-// requested provider over each chunk independently, then merges through the
-// same sort+dedup pass used for a single unchunked scan — which is what
-// makes chunked results identical to unchunked ones (same findings, same
-// order, no dupes, no losses), rather than something asserted and hoped for.
-// Chunks run concurrently (Promise.all), not sequentially — for the mock
-// provider this is free (it's synchronous), but for the llm provider it
-// keeps a multi-chunk diff's total latency close to one model call's
-// duration instead of multiplying it by chunk count. If any chunk's call
-// fails, the whole review fails — no partial results, matching "one
-// attempt, clear failure" for the llm provider.
+// Chunks the diff, runs the provider per chunk, then merges through the same
+// sort+dedup pass a single-chunk scan uses — why chunked and unchunked
+// results are identical, not just assumed to be. Chunks run concurrently:
+// free for the synchronous mock provider, and keeps a multi-chunk llm diff's
+// latency near one call's duration instead of N. One chunk failing fails the
+// whole review — no partial results, matching llm's "one attempt" contract.
 export async function runReview(provider: ProviderName, diffText: string, llmConfig?: LlmConfig): Promise<Finding[]> {
   const chunks = chunkDiff(diffText);
   const results = await Promise.all(chunks.map((chunk) => runProvider(provider, chunk, llmConfig)));

@@ -504,3 +504,23 @@ service-wide rate-limit budget documented below.
   `string | null` to `ErrorCode | null` first (the read-path counterpart to
   the write-path type already tightened on `markJobFailed`), so a small
   design decision, not a mechanical one.
+- **Advisory lock around the migration loop (`src/db/migrate.ts`).** No
+  `pg_advisory_lock` today — fine for the current single-instance deployment
+  (matches CLAUDE.md's documented no-horizontal-scaling scope), but would be
+  needed if this were ever scaled to multiple instances, so two processes
+  booting at once can't race to apply the same migration file.
+- **Auth boundary via Fastify plugin encapsulation, as a stronger
+  alternative to the current `routeOptions.url` fix.** Registering all
+  `/v1/*` routes inside a Fastify plugin (`app.register(apiRoutes, { prefix:
+  "/v1" })`) and scoping the auth hook to that plugin instance would mean
+  auth never inspects any string form of the request path at all — it'd be
+  guaranteed by Fastify's own route-tree encapsulation instead of by reading
+  (correctly, but still by reading) `routeOptions.url`. That's structurally
+  stronger than the current fix, not just a stylistic alternative. I didn't
+  implement it: `src/plugins/auth.ts` is the exact file that had a real
+  authentication bypass earlier in this project, and it has since passed
+  thorough, live-verified bypass testing (six distinct encoding/traversal
+  vectors). Refactoring it again this close to submission, to replace
+  something already correct and heavily tested, risks introducing a new bug
+  in the one place that can least afford one — worth doing with more time
+  and room to re-verify properly, not worth the risk right now.

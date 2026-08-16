@@ -57,7 +57,9 @@ function extractPath(headerValue: string): string | null {
   if (withoutTimestamp === "" || withoutTimestamp === "/dev/null") {
     return null;
   }
-  // Strip a single leading "a/" or "b/" style prefix used by git-style diffs.
+  // Git-style diffs prefix every path with "a/" (old) or "b/" (new) to keep
+  // them visually distinct from real repo-relative paths — strip it to
+  // recover the actual path.
   return withoutTimestamp.replace(/^[ab]\//, "");
 }
 
@@ -109,7 +111,6 @@ export function parseDiff(diffText: string): AddedLine[] {
 
     const kind = classifyHunkLine(line);
     if (kind === "no-newline-marker") {
-      // "\ No newline at end of file" — not a real line, doesn't move counters.
       continue;
     }
     if (kind === "added") {
@@ -121,7 +122,6 @@ export function parseDiff(diffText: string): AddedLine[] {
     } else if (kind === "removed") {
       oldRemaining--;
     } else {
-      // Context line (starts with a space, or is malformed/blank).
       newLineNum++;
       oldRemaining--;
       newRemaining--;

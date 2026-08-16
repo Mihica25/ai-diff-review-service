@@ -79,7 +79,9 @@ function splitIntoFileSections(diffText: string): string[] {
       oldRemaining--;
       newRemaining--;
     }
-    // "no-newline-marker" doesn't count against either side.
+    // "no-newline-marker" is deliberately excluded here — it's an EOF
+    // marker, not a real content line, so it never counts against either
+    // side's remaining total.
 
     if (oldRemaining <= 0 && newRemaining <= 0) {
       inHunk = false;

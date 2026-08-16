@@ -1,30 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { errorEnvelope } from "../errors";
 
-// request.url is the raw, percent-*encoded* path as received — NOT what
-// Fastify's router actually matches against, which decodes first. A request
-// to "/%76%31/reviews" (percent-encoded "/v1/reviews") has a raw request.url
-// that does not start with "/v1/", so a naive string check on it (or even
-// `new URL(...).pathname`, which normalizes "." / ".." segments but does NOT
-// decode percent-encoded characters — verified directly, both were tried and
-// both still let this exact request through) is bypassed entirely, while the
-// router still decodes and dispatches it to the real, unauthenticated
-// handler underneath.
-//
-// request.routeOptions.url is the fix: it's Fastify's own record of which
-// route it actually matched (confirmed empirically: for a request to
-// "/%76%31/reviews/abc", routeOptions.url is exactly "/v1/reviews/:jobId"),
-// so checking that instead can never diverge from what actually gets
-// dispatched — no encoding trick can fool it, because it isn't re-deriving
-// the decoding, it's reading Fastify's own answer.
-//
-// routeOptions.url is only populated once a route has matched. For a
-// request that matches no route at all, it's undefined — but that request
-// 404s regardless, so there's no handler underneath to protect; a best-effort
-// check against the (still possibly-encoded) raw path is used only to decide
-// whether such a request gets a 401 instead of a 404 (hiding whether an
-// unmatched /v1/* sub-route exists), which carries no security consequence
-// either way since nothing sensitive is ever reachable there.
+// Fallback for the rare case routeOptions.url is unset (no route matched at
+// all) — decodes the raw path best-effort, only to decide whether such a
+// request gets a 401 instead of a 404 (hiding whether an unmatched /v1/*
+// sub-route exists). No security consequence either way, since nothing
+// sensitive is ever reachable at an unmatched route.
 function bestEffortPathname(rawUrl: string): string {
   const rawPath = rawUrl.split("?")[0] ?? "";
   try {
@@ -34,9 +15,20 @@ function bestEffortPathname(rawUrl: string): string {
   }
 }
 
-// Applies to every /v1/* route (all methods, including GET). Runs in onRequest
-// so an unauthenticated call to an unknown /v1/* path still gets 401, not a
-// 404 that would reveal which routes exist.
+// Applies to every /v1/* route (all methods, including GET). Runs in
+// onRequest so an unauthenticated call to an unknown /v1/* path still gets
+// 401, not a 404 that would reveal which routes exist.
+//
+// Checks request.routeOptions.url (Fastify's own record of the route it
+// matched) rather than request.url, which is the raw, still percent-encoded
+// path — a naive check on that, or even `new URL(...).pathname` (normalizes
+// dot-segments but does NOT decode percent-encoding — verified directly),
+// lets an encoded "/v1/..." path slip past unauthenticated while Fastify's
+// router still decodes and dispatches it underneath (see server.test.ts's
+// regression tests for the exact bypass). routeOptions.url can't be fooled this
+// way, since it's Fastify's own answer, not a re-derived guess; it's only
+// unset for a request that matches no route, which falls back to
+// bestEffortPathname() above and 404s regardless.
 export function registerAuth(app: FastifyInstance, bearerToken: string): void {
   app.addHook("onRequest", async (request, reply) => {
     const path = request.routeOptions?.url ?? bestEffortPathname(request.url);

@@ -5,13 +5,13 @@ import type { ErrorCode } from "../errors";
 import { insertJobEvent, insertJobEvents, type JobEventType } from "./jobEvents";
 import { insertCacheEntry } from "./cache";
 
-// Shared by insertJob/insertCachedJob/claimQueuedJobs/markJobDone/
-// markJobFailed instead of each hand-rolling its own connect/BEGIN/COMMIT/
-// catch-ROLLBACK/finally-release wrapper. Callers that need to classify a
-// rolled-back error (e.g. insertJob's IdempotencyKeyRace check) still do
-// that in their own catch block, after this rethrows — rollback happens
-// exactly once, here, regardless of what the caller does with the error
-// afterward.
+// Shared by insertJob/insertCachedJob (via withIdempotency below),
+// claimQueuedJobs, markJobDone, and markJobFailed instead of each
+// hand-rolling its own connect/BEGIN/COMMIT/catch-ROLLBACK/finally-release
+// wrapper. Callers that need to classify a rolled-back error (see
+// withIdempotency's IdempotencyKeyRace check) still do that after this
+// rethrows — rollback happens exactly once, here, regardless of what
+// happens to the error afterward.
 async function withTransaction<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
@@ -131,26 +131,29 @@ function isIdempotencyKeyViolation(err: unknown): boolean {
   );
 }
 
-// Job creation, its first job_event (status: queued), and — if an
-// Idempotency-Key was supplied — the idempotency_keys row are all written in
-// one transaction: a job can never exist without the event a stream replay
-// would need, and a key can never point at a job that failed to commit.
-export async function insertJob(pool: Pool, job: NewJob, idempotency?: IdempotencyWrite): Promise<void> {
+// Wraps withTransaction with the idempotency_keys insert (when a key was
+// supplied) and the IdempotencyKeyRace reclassification — previously
+// copy-pasted identically between insertJob and insertCachedJob. `fn` does
+// only the job/event inserts specific to each caller; the idempotency_keys
+// row, if any, is always the last write in the same transaction, and a race
+// on it is always translated to IdempotencyKeyRace the same way.
+async function withIdempotency<T>(
+  pool: Pool,
+  jobId: string,
+  idempotency: IdempotencyWrite | undefined,
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
   try {
-    await withTransaction(pool, async (client) => {
-      await client.query(
-        `INSERT INTO jobs (id, status, provider, diff, options, content_hash, usage_input_bytes, usage_chunks, usage_cache_hit)
-         VALUES ($1, 'queued', $2, $3, $4, $5, $6, $7, false)`,
-        [job.id, job.provider, job.diff, JSON.stringify(job.options), job.contentHash, job.inputBytes, job.chunks],
-      );
-      await insertJobEvent(client, job.id, "status", { status: "queued" });
+    return await withTransaction(pool, async (client) => {
+      const result = await fn(client);
       if (idempotency) {
         await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
           idempotency.key,
-          job.id,
+          jobId,
           idempotency.bodyHash,
         ]);
       }
+      return result;
     });
   } catch (err) {
     if (idempotency && isIdempotencyKeyViolation(err)) {
@@ -160,59 +163,58 @@ export async function insertJob(pool: Pool, job: NewJob, idempotency?: Idempoten
   }
 }
 
+// Job creation and its first job_event (status: queued) are written in one
+// transaction — a job can never exist without the event a stream replay
+// would need. The idempotency_keys row, if any, is added by withIdempotency,
+// so a key can never point at a job that failed to commit.
+export async function insertJob(pool: Pool, job: NewJob, idempotency?: IdempotencyWrite): Promise<void> {
+  await withIdempotency(pool, job.id, idempotency, async (client) => {
+    await client.query(
+      `INSERT INTO jobs (id, status, provider, diff, options, content_hash, usage_input_bytes, usage_chunks, usage_cache_hit)
+       VALUES ($1, 'queued', $2, $3, $4, $5, $6, $7, false)`,
+      [job.id, job.provider, job.diff, JSON.stringify(job.options), job.contentHash, job.inputBytes, job.chunks],
+    );
+    await insertJobEvent(client, job.id, "status", { status: "queued" });
+  });
+}
+
 // The cache-hit path: writes a job that's already 'done' — full event
 // sequence (queued -> running -> finding(s) -> done) included — in one
 // transaction, with no worker involvement at all. All events go through a
 // single insertJobEvents batch call rather than one write per event: this is
 // the hot path for repeated/duplicate submissions (the case caching exists
 // to make cheap), so it's exactly where holding a pooled connection across
-// N unbatched round trips would be most counterproductive. Same
-// IdempotencyKeyRace handling as insertJob, since a cache-hit submission can
-// carry an Idempotency-Key too.
+// N unbatched round trips would be most counterproductive.
 export async function insertCachedJob(
   pool: Pool,
   job: NewJob,
   findings: Finding[],
   idempotency?: IdempotencyWrite,
 ): Promise<void> {
-  try {
-    await withTransaction(pool, async (client) => {
-      await client.query(
-        `INSERT INTO jobs (id, status, provider, diff, options, content_hash, findings, usage_input_bytes, usage_chunks, usage_cache_hit, finished_at)
-         VALUES ($1, 'done', $2, $3, $4, $5, $6, $7, $8, true, now())`,
-        [
-          job.id,
-          job.provider,
-          job.diff,
-          JSON.stringify(job.options),
-          job.contentHash,
-          JSON.stringify(findings),
-          job.inputBytes,
-          job.chunks,
-        ],
-      );
-      const usage = { inputBytes: job.inputBytes, chunks: job.chunks, cacheHit: true };
-      const events: Array<{ eventType: JobEventType; payload: unknown }> = [
-        { eventType: "status", payload: { status: "queued" } },
-        { eventType: "status", payload: { status: "running" } },
-        ...findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
-        { eventType: "done", payload: { total: findings.length, usage } },
-      ];
-      await insertJobEvents(client, job.id, events);
-      if (idempotency) {
-        await client.query("INSERT INTO idempotency_keys (key, job_id, body_hash) VALUES ($1, $2, $3)", [
-          idempotency.key,
-          job.id,
-          idempotency.bodyHash,
-        ]);
-      }
-    });
-  } catch (err) {
-    if (idempotency && isIdempotencyKeyViolation(err)) {
-      throw new IdempotencyKeyRace(err);
-    }
-    throw err;
-  }
+  await withIdempotency(pool, job.id, idempotency, async (client) => {
+    await client.query(
+      `INSERT INTO jobs (id, status, provider, diff, options, content_hash, findings, usage_input_bytes, usage_chunks, usage_cache_hit, finished_at)
+       VALUES ($1, 'done', $2, $3, $4, $5, $6, $7, $8, true, now())`,
+      [
+        job.id,
+        job.provider,
+        job.diff,
+        JSON.stringify(job.options),
+        job.contentHash,
+        JSON.stringify(findings),
+        job.inputBytes,
+        job.chunks,
+      ],
+    );
+    const usage = { inputBytes: job.inputBytes, chunks: job.chunks, cacheHit: true };
+    const events: Array<{ eventType: JobEventType; payload: unknown }> = [
+      { eventType: "status", payload: { status: "queued" } },
+      { eventType: "status", payload: { status: "running" } },
+      ...findings.map((finding) => ({ eventType: "finding" as const, payload: finding })),
+      { eventType: "done", payload: { total: findings.length, usage } },
+    ];
+    await insertJobEvents(client, job.id, events);
+  });
 }
 
 // GET /v1/reviews/{jobId} and the SSE stream route both need the job's

@@ -27,18 +27,13 @@ export interface StreamJobEventsOptions {
   maxStreamMs?: number;
 }
 
-// Replays job_events in storage order, then — if the job isn't terminal yet
-// — keeps polling for new rows (same low-tech polling philosophy as the
-// worker itself) until a `done` event appears, at which point it returns and
-// the caller closes the connection. Never reconstructs events from current
-// job state: everything written here comes straight from job_events, which
-// is what makes two connections to a finished job's stream produce
-// byte-identical output.
-//
-// Extracted from the route handler (rather than inlined) specifically so its
-// heartbeat/poll timing can be exercised directly in tests with millisecond
-// intervals — actually waiting out the real 15s heartbeat interval in a test
-// isn't practical, but the same logic with a 50ms interval is.
+// Replays job_events in storage order, then — if not yet terminal — polls
+// for new rows (same low-tech philosophy as the worker) until `done`
+// appears. Never reconstructs events from current job state, always reads
+// job_events directly — why two connections to a finished job's stream
+// produce byte-identical output. Extracted from the route handler so its
+// heartbeat/poll timing can be tested with millisecond intervals instead of
+// waiting out the real 15s/200ms ones.
 export async function streamJobEvents(
   pool: Pool,
   jobId: string,
