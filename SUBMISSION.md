@@ -187,12 +187,9 @@ read-through. It surfaced eight real, reproducible bugs across these
 phases; I judged each one worth fixing and had Claude Code fix and test all
 of them:
 
-- **Malformed `jobId` returned 500 instead of 404.** `GET /v1/reviews/:jobId`
-  passed the raw path param straight into a Postgres `uuid` column with no
-  format check, so a non-UUID id made the query itself throw and fall through
-  to a generic 500. Three independent review passes converged on the same
-  root cause. Fixed by validating the id as a UUID before it ever reaches the
-  database, and confirmed against the live deployment.
+- **Malformed `jobId` returned 500 instead of 404** — three independent
+  review passes converged on the same root cause. Fixed by validating the id
+  as a UUID before it ever reaches the database.
 - **Worker shutdown race could strand a job in `running` forever.** `stop()`
   only snapshotted the in-flight job set, so a job claimed from Postgres in
   the exact moment shutdown began could be abandoned mid-processing — a real
@@ -209,48 +206,29 @@ of them:
   rejection — taking down every other in-flight job, not just the one that
   failed. Fixed by wrapping the fallback write in its own try/catch so a
   double failure only logs, never crashes.
-- **Raw internal error text could leak to API clients.** Any unexpected
-  exception during processing stored its raw message and returned it
-  verbatim in the public `GET` response. Fixed by distinguishing the one
-  deliberate, safe-to-expose error from everything else, which now gets a
-  generic client-facing message while the real error is logged server-side
-  only.
-- **Removed-line content misread as a file-header boundary mid-chunk.** The
-  chunker's file-boundary splitter used naive line-prefix matching (`--- `),
-  so a removed line whose own content started with `-- ` became
-  indistinguishable from a real file-header line once the diff's `-` marker
-  was prepended — silently truncating a file's diff and losing every finding
-  after that point. Fixed by making the splitter hunk-bounded, the same class
-  of fix `parseDiff.ts` already needed once — this time sharing the
-  hunk-header parser between both files so they can't drift apart again.
-- **Boundary detection picked one header style for the whole document,
-  breaking mixed-format diffs.** A single global choice between git-style and
-  plain-style file headers meant a diff mixing both (a header-less file
-  immediately after a git-style one) would silently merge the two into one
-  chunk. Claude Code's first fix attempt introduced its own bug — a flag that
-  never got reset — caught by the regression test written alongside the fix,
-  not by inspection. Fixed with a state model scoped per-section instead of
-  per-document.
-- **Sequential per-finding database writes risked connection-pool exhaustion
-  under load.** `markJobDone` held one of only 10 pooled connections open
-  across N sequential awaited inserts (one per finding) — directly matching a
-  failure mode already flagged in this project's own conventions as "the
-  most plausible way to accidentally trip never 5xx under load." Fixed with a
-  single batched multi-row insert instead of N round trips, plus capping
-  `maxFindings` at 1000 (previously unbounded); verified live with 60
-  findings written and correctly replayed in one round trip.
+- **Raw internal error text could leak to API clients** — fixed by exposing
+  only one deliberate, safe-to-expose error message; everything else logs
+  server-side only.
+- **A removed line starting with `-- ` was misread as a file-header
+  boundary mid-chunk, silently truncating a file's findings** — fixed by
+  making the splitter hunk-bounded instead of prefix-matching, sharing the
+  hunk-header parser with `parseDiff.ts` so they can't drift apart again.
+- **A single global header-style choice broke diffs mixing git-style and
+  plain-format files** — fixed with a state model scoped per-section
+  instead of per-document.
+- **Sequential per-finding database writes risked connection-pool
+  exhaustion under load** — fixed with one batched multi-row insert instead
+  of N round trips, plus capping `maxFindings` at 1000.
 - **`job_events.id` was silently returned as a string despite being typed
-  `number`** (Postgres returns `bigserial` columns as strings by default).
-  Fixed with an explicit type parser; confirmed live that ids render as
-  clean integers.
+  `number`** — fixed with an explicit type parser matching the declared type.
 
 ### Phase 6 (idempotency + caching): mostly deferred, two worth calling out
 
 The same review process ran against Phase 6. Most of what it surfaced was
-duplication and style observations, which I judged not worth fixing given
-the time budget — those are left as `TODO` comments at their exact locations
-in the code rather than silently dropped. Two findings were real bugs I
-approved fixing:
+duplication and style observations, which I judged not worth the effort
+relative to their impact — those are left as `TODO` comments at their exact
+locations in the code rather than silently dropped. Two findings were real
+bugs I approved fixing:
 
 - **A cache-write failure could report a successful review as failed.** The
   review flagged that `markJobDone` wrote its cache-population insert inside
@@ -267,58 +245,33 @@ approved fixing:
 
 ### Hardening ahead of Phase 7 (rate limiting): four fixes from a second review pass
 
-Before starting the rate-limiting phase, I asked Claude Code to sweep the
-codebase's own TODO comments for anything that could plausibly interact with
-a load test — since Phase 7 is specifically about proving "never 5xx under
-load," this seemed like the moment those TODOs would actually get exercised
-for the first time. It flagged four: a `SELECT *` pulling the full diff (up
-to 1 MiB) on every polling `GET`, a SELECT-then-UPDATE claim path holding a
-connection open across two round trips, fixed-interval worker polling paying
-for a full claim transaction five times a second even when the queue was
-empty, and an O(n²) chunk-packing loop that also ran twice per submission. I
-separately got an unsolicited recommendation from another AI tool flagging
-the same four issues almost exactly — a useful independent check, since it
-converged on the same diagnosis (connection-pool pressure and event-loop
-blocking) from a fresh read of the code. I compared the two, approved fixing
-all four, and had Claude Code implement them: `getJobById` now selects an
-explicit column list excluding `diff`; `claimQueuedJobs` collapsed to one
-`UPDATE ... RETURNING` statement; the worker backs off its poll interval
-(capped at 2s) when the queue is confirmed empty, resetting the moment
-there's real work; and `chunkDiff`/the new `countChunks` share one
-packing-and-counting pass, with that packing loop itself fixed from O(n²)
-to O(n). The file-boundary split itself still runs once at submission time
-(`countChunks`) and once at processing time (`chunkDiff`, inside the
-worker) — only the more expensive packing/join step was deduplicated,
-since the split is a cheap linear pass, not the O(n²) risk the packing
-loop was. An early draft of this section overstated that as full
-elimination; caught by review and corrected.
+A pre-Phase-7 TODO sweep (cross-checked against an unsolicited, independent
+recommendation from another AI tool that converged on the same four issues)
+found: `getJobById` pulling the full diff via `SELECT *` on every polling
+`GET`; a SELECT-then-UPDATE claim path holding a connection open across two
+round trips; fixed-interval worker polling paying for a full claim
+transaction even when the queue was empty; and an O(n²) chunk-packing loop.
+Fixed: `getJobById` now selects an explicit column list excluding `diff`;
+`claimQueuedJobs` collapsed to one `UPDATE ... RETURNING` statement; the
+worker backs off its poll interval (capped at 2s) when the queue is
+confirmed empty; and the packing loop is O(n) instead of O(n²) — the
+file-boundary split itself still runs twice per submission (once for the
+count, once for processing), only the packing/join step was deduplicated.
 
-Writing the single-statement claim query is what actually caught a real bug:
-Postgres does not preserve a subquery's `ORDER BY` in an `UPDATE ...
-RETURNING`'s row order, which broke this project's own FIFO-claim-order
-regression test the moment the query was rewritten — not a hypothetical
-risk, a test failure that showed up immediately. My first fix sorted the
-returned rows by `created_at` in application code before mapping; a later
-review pass pointed out that ordering guarantee could live entirely in SQL
-instead, via a `WITH claimed AS (UPDATE ... RETURNING *) SELECT * FROM
-claimed ORDER BY created_at ASC`. I approved switching to that — it's the
-same single round trip, but the guarantee is now enforced declaratively by
-Postgres rather than by a comparator someone could typo later with nothing
-catching it.
+Writing the single-statement claim query surfaced a real bug: Postgres
+doesn't preserve a subquery's `ORDER BY` through `UPDATE ... RETURNING`,
+which broke the FIFO-claim-order regression test immediately. Fixed by
+moving the ordering into a `WITH claimed AS (...) SELECT * FROM claimed
+ORDER BY created_at ASC`, enforcing it declaratively in SQL instead of a
+JS-side sort.
 
-The same review pass around this phase's worker changes caught one more
-real bug, independently flagged by two different review angles running in
-parallel (the same convergent-signal pattern as the Phase 0-5 bugs above):
-the new poll-interval backoff treated a caught `claimQueuedJobs` error
-identically to a confirmed-empty queue, backing the interval off toward its
-2-second cap during exactly the kind of transient DB hiccup CLAUDE.md
-already flags as the likeliest load-test failure mode — slowing retries
-down right when fast retry matters most. I approved fixing it: the backoff
-now only engages when a claim attempt affirmatively confirms zero queued
-jobs, with the decision itself pulled out into a small pure function
-(`nextPollInterval`) specifically so it has a direct unit test — the
-existing worker test couldn't have caught this, since it always succeeds on
-the very first tick, before any backoff logic ever runs.
+The same pass caught one more real bug, independently flagged by two
+parallel review angles: the poll-interval backoff treated a caught
+`claimQueuedJobs` error identically to a confirmed-empty queue, slowing
+retries during exactly the kind of DB hiccup that matters most. Fixed by
+only backing off on an affirmatively confirmed empty queue, with the
+decision extracted into a pure function (`nextPollInterval`) specifically
+so it has a direct unit test.
 
 ### Phase 8 (llm provider): Anthropic behind the same pipeline, two fixes from a partial review pass
 
@@ -479,48 +432,22 @@ service-wide rate-limit budget documented below.
 
 ## What I'd do next with more time
 
-- **Constant-time bearer token comparison.** `src/plugins/auth.ts` compares
-  the bearer token with plain `!==`, which is not constant-time and in
-  principle leaks a timing side-channel an attacker could use to guess the
-  token character-by-character. For this project's scope I judged it an
-  acceptable simplification, not worth fixing now, but a production version
-  of this service should use `crypto.timingSafeEqual` for that comparison.
-- **Crash-recovery for jobs already claimed at the moment of a hard process
-  crash.** `stop()` handles a clean shutdown correctly, but nothing re-claims
-  a `running` row left behind by a crash that skips `stop()` entirely. Not a
-  quick fix: it needs a staleness threshold (how long is "probably dead," not
-  just "slow"), a reclaim query built around that threshold, and careful
-  handling of the race between a genuinely dead worker and one that's simply
-  still working a large job — reclaiming too eagerly risks two workers
-  processing the same job at once, which the current `SKIP LOCKED` design
-  otherwise makes impossible.
-- **`GET /v1/reviews/{jobId}`'s error field via `errorEnvelope()`.** The
-  handler builds `body.error = {code, message}` by hand instead of reusing
-  the shared `errorEnvelope()` helper used everywhere else. Not a one-line
-  swap, though: `errorEnvelope()` returns a *full* envelope
-  (`{error: {code, message}}`), not the bare pair needed here, since it gets
-  embedded inside a larger response alongside `jobId`/`status`/`findings`/
-  `usage`. Doing this cleanly also means tightening `JobRow.errorCode` from
-  `string | null` to `ErrorCode | null` first (the read-path counterpart to
-  the write-path type already tightened on `markJobFailed`), so a small
-  design decision, not a mechanical one.
-- **Advisory lock around the migration loop (`src/db/migrate.ts`).** No
-  `pg_advisory_lock` today — fine for the current single-instance deployment
-  (matches CLAUDE.md's documented no-horizontal-scaling scope), but would be
-  needed if this were ever scaled to multiple instances, so two processes
-  booting at once can't race to apply the same migration file.
-- **Auth boundary via Fastify plugin encapsulation, as a stronger
-  alternative to the current `routeOptions.url` fix.** Registering all
-  `/v1/*` routes inside a Fastify plugin (`app.register(apiRoutes, { prefix:
-  "/v1" })`) and scoping the auth hook to that plugin instance would mean
-  auth never inspects any string form of the request path at all — it'd be
-  guaranteed by Fastify's own route-tree encapsulation instead of by reading
-  (correctly, but still by reading) `routeOptions.url`. That's structurally
-  stronger than the current fix, not just a stylistic alternative. I didn't
-  implement it: `src/plugins/auth.ts` is the exact file that had a real
-  authentication bypass earlier in this project, and it has since passed
-  thorough, live-verified bypass testing (six distinct encoding/traversal
-  vectors). Refactoring it again this close to submission, to replace
-  something already correct and heavily tested, risks introducing a new bug
-  in the one place that can least afford one — worth doing with more time
-  and room to re-verify properly, not worth the risk right now.
+- **Constant-time bearer token comparison.** `src/plugins/auth.ts` uses
+  plain `!==`, which isn't constant-time; a production version should use
+  `crypto.timingSafeEqual`.
+- **Crash-recovery for jobs claimed at the moment of a hard process crash.**
+  `stop()` handles clean shutdown, but nothing re-claims a `running` row
+  left behind by a crash — needs a staleness-based reclaim query, not a
+  quick fix.
+- **`GET /v1/reviews/{jobId}`'s error field via `errorEnvelope()`.** Built
+  by hand instead of the shared helper; not a one-line swap, since it needs
+  `JobRow.errorCode` tightened to `ErrorCode | null` first.
+- **Advisory lock around the migration loop.** No `pg_advisory_lock`
+  today — fine for the current single-instance deployment, but needed if
+  ever scaled to multiple instances.
+- **Auth boundary via Fastify plugin encapsulation.** Structurally stronger
+  than the current `routeOptions.url` fix (auth guaranteed by Fastify's own
+  route-tree encapsulation, not by reading any string form of the path) —
+  not implemented now, since refactoring the auth-critical file this close
+  to submission risks introducing a new bug in the one place that can least
+  afford one.
